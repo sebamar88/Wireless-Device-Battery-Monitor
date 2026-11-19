@@ -6,6 +6,7 @@
 #include "../platform_compat.h"
 #include "../devices.h"
 #include "../hid.h"
+#include "../json_output.h"
 
 #include <gtk/gtk.h>
 
@@ -48,7 +49,7 @@ struct State {
     GtkApplication* app = nullptr;
     GDBusConnection* conn = nullptr;
     GVariant* pixmap = nullptr;           // a(iiay), cached for SNI property reads
-    std::string tooltip = "Wireless Battery";
+    std::string tooltip = "BatteryHub";
     std::vector<DeviceStatus> devices;
     std::vector<std::string> deviceActions;
     std::vector<MenuNode> menuNodes;  // com.canonical.dbusmenu tree (id 0 is the root)
@@ -106,7 +107,7 @@ void ApplyAutostart(bool on) {
     g_autofree gchar* exe = g_file_read_link("/proc/self/exe", nullptr);
     if (!exe) return;
     std::string content =
-        "[Desktop Entry]\nType=Application\nName=Wireless Battery\n"
+        "[Desktop Entry]\nType=Application\nName=BatteryHub\n"
         "Comment=Show battery levels of wireless devices in the tray\n"
         "Exec=\"" + std::string(exe) + "\"\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n";
     g_file_set_contents(path.c_str(), content.c_str(), (gssize)content.size(), nullptr);
@@ -307,7 +308,7 @@ void RebuildMenu() {
 void RecomputePresentation() {
     int pct = -1;
     bool charging = false, dim = false, low = false, any = false;
-    std::string tip = "Wireless Battery";
+    std::string tip = "BatteryHub";
     for (const auto& s : g.devices) {
         if (!IsVisible(s)) continue;
         any = true;
@@ -315,11 +316,11 @@ void RecomputePresentation() {
         else dim = true;
         charging |= s.charging;
         if (s.percent >= 0 && s.percent <= kLowBattery && !s.charging) low = true;
-        if (tip != "Wireless Battery") tip += "\n";
+        if (tip != "BatteryHub") tip += "\n";
         else tip = "";
         tip += WideToUtf8(s.name) + ": " + WideToUtf8(StatusText(s));
     }
-    if (!any) { pct = -1; tip = "Wireless Battery\nNo devices with battery info found"; }
+    if (!any) { pct = -1; tip = "BatteryHub\nNo devices with battery info found"; }
     if (g.pixmap) g_variant_unref(g.pixmap);
     g.pixmap = RenderPixmap(pct, charging, dim, low);
     g.tooltip = tip;
@@ -393,13 +394,13 @@ static GVariant* sni_get_property(GDBusConnection*, const gchar*, const gchar*, 
                                   const gchar* name, GError**, gpointer) {
     if (!strcmp(name, "Id")) return g_variant_new_string("wireless-battery");
     if (!strcmp(name, "Category")) return g_variant_new_string("SystemServices");
-    if (!strcmp(name, "Title")) return g_variant_new_string("Wireless Battery");
+    if (!strcmp(name, "Title")) return g_variant_new_string("BatteryHub");
     if (!strcmp(name, "IconName")) return g_variant_new_string("battery-good-symbolic");
     if (!strcmp(name, "IconPixmap"))
         return g.pixmap ? g_variant_ref(g.pixmap) : RenderPixmap(-1, false, true, false);
     if (!strcmp(name, "ToolTip")) {
         GVariant* px = g.pixmap ? g_variant_ref(g.pixmap) : RenderPixmap(-1, false, true, false);
-        return g_variant_new("(s@a(iiay)ss)", "", px, "Wireless Battery", g.tooltip.c_str());
+        return g_variant_new("(s@a(iiay)ss)", "", px, "BatteryHub", g.tooltip.c_str());
     }
     if (!strcmp(name, "Menu")) return g_variant_new_object_path(kMenuPath);
     if (!strcmp(name, "ItemIsMenu")) return g_variant_new_boolean(TRUE);
@@ -632,6 +633,13 @@ int ListToConsole(bool dump) {
     return 0;
 }
 
+// Machine-readable device list for scripts and bar widgets. Shared with the Windows entry point.
+int ListJson() {
+    std::string out = DevicesToJson(PollAllDevices());
+    fwrite(out.data(), 1, out.size(), stdout);
+    return 0;
+}
+
 int QuitRunning() {
     GError* error = nullptr;
     GDBusConnection* conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
@@ -639,7 +647,7 @@ int QuitRunning() {
     GVariant* reply = g_dbus_connection_call_sync(conn, kAppId, kSniPath,
                                                   "com.github.krisgfx9.WirelessBattery", "Quit",
                                                   nullptr, nullptr, G_DBUS_CALL_FLAGS_NONE, 3000, nullptr, &error);
-    if (!reply) { fprintf(stderr, "Is Wireless Battery running? %s\n", error->message); g_error_free(error); }
+    if (!reply) { fprintf(stderr, "Is BatteryHub running? %s\n", error->message); g_error_free(error); }
     else g_variant_unref(reply);
     g_object_unref(conn);
     return 0;
@@ -649,7 +657,18 @@ int QuitRunning() {
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("Usage: wireless-battery [option]\n"
+                   "  (no option)  Run the tray app\n"
+                   "  --list       Print devices and battery levels, then exit\n"
+                   "  --json       Print a JSON array of devices and battery levels, then exit\n"
+                   "  --dump       Print all HID collections and devices, then exit\n"
+                   "  --quit       Ask a running instance to quit\n"
+                   "  -h, --help   Show this help\n");
+            return 0;
+        }
         if (!strcmp(argv[i], "--list")) return ListToConsole(false);
+        if (!strcmp(argv[i], "--json")) return ListJson();
         if (!strcmp(argv[i], "--dump")) return ListToConsole(true);
         if (!strcmp(argv[i], "--quit")) return QuitRunning();
     }

@@ -120,15 +120,15 @@ def messages(tag, repo, updates, devices):
     msgs = []
     for i, body in enumerate(chunks(updates)):
         last = i == len(chunks(updates)) - 1
-        embed = {"title": f"Wireless Battery {tag}: what's new" + (" (continued)" if i else ""), "url": release,
+        embed = {"title": f"BatteryHub {tag}: what's new" + (" (continued)" if i else ""), "url": release,
                  "description": body + (f"\n[Download {tag}]({release})" if last else ""), "color": COLOR_UPDATES}
-        msgs.append({"username": "Wireless Battery", "embeds": [embed]})
+        msgs.append({"username": "BatteryHub", "embeds": [embed]})
     for i, body in enumerate(chunks(devices)):
         last = i == len(chunks(devices)) - 1
         footer = f"\n[All supported devices]({SITE_SUPPORTED}) · [Request a device]({SITE_REQUEST})" if last else ""
         embed = {"title": f"New supported devices in {tag}" + (" (continued)" if i else ""), "url": SITE_SUPPORTED,
                  "description": body + footer, "color": COLOR_DEVICES}
-        msgs.append({"username": "Wireless Battery", "embeds": [embed]})
+        msgs.append({"username": "BatteryHub", "embeds": [embed]})
     return msgs
 
 

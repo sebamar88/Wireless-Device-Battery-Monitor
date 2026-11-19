@@ -2,6 +2,19 @@
 // and HIDV1WirelessConnectionStateProp (GET 68) for Q350TV1. Each returns one payload byte.
 // The Windows collection is documented in https://github.com/krisgfx9/Wireless-Device-Battery-Monitor/issues/259
 //
+// Quantum 610 Wireless (0ECB:205C, ID from JBL's QuantumUSBAudio.inf as listed in
+// https://github.com/sidmax7/QuantumEngine quantum-linux/crates/jbl-quantum/src/models.rs): the same HIDV1
+// GET 49 (battery, 0-100) and GET 68 (link, 01 = headset connected) on HID interface 5, captured on a real
+// 610 dongle in https://github.com/Tymon3310/jbl-quantum-linux/blob/main/docs/QUANTUM610_PACKETS.md.
+// The firmware answers an unimplemented report id with the previous implemented one, so the reply's
+// first byte must match the id asked for (GetFeatureByte checks it). Only GETs are sent.
+//
+// Quantum 360 Wireless (0ECB:2115, same ID source; dongle listed with the HIDV1 dongle models in
+// https://github.com/Tymon3310/jbl-quantum-linux/blob/main/docs/QUANTUM_LINEUP.md). Not HIDV3: its
+// Windows dump in https://github.com/krisgfx9/Wireless-Device-Battery-Monitor/issues/183 has no FF12
+// collection, only the 350's layout of a Generic Desktop usage 0 collection (interface 5, 64-byte
+// feature = the 63-byte HIDV1 reports) next to a telephony one. Same read-only GET 68 / GET 49.
+//
 // JBL Quantum 520 / 650 / 850 / 950 (and X variants) headsets, vendor 0ECB, "HIDV3" protocol on the
 // vendor collection with usage page FF12 (64-byte reports: input 86, output 87, feature 88).
 //   request (feature 88): [88][00 DD][01 00][01][00][02 00][feature lo][feature hi]
@@ -53,31 +66,41 @@ bool GetBattery(HidDev& d, BYTE& info) {
     return false;
 }
 
-void PollQuantum350(PollContext& ctx) {
-    constexpr USHORT pid = 0x206B;
-    if (ctx.IsClaimed(kVid, pid)) return;
-    for (const auto* c : ctx.Find(kVid, pid, [](const HidColl& c) {
-             return c.iface == 3 && c.page() == 1 && c.usage() == 0 && c.featLen() >= 2;
-         })) {
-        HidDev d;
-        BYTE linked = 0, percent = 0;
-        if (!d.OpenReadOnly(*c) || !d.GetFeatureByte(0x68, linked) || linked != 1 ||
-            !d.GetFeatureByte(0x49, percent) || percent > 100) continue;
-        DeviceStatus s;
-        s.key = L"jbl:" + Hex4(pid);
-        s.name = L"JBL Quantum 350 Wireless";
-        s.kind = DeviceKind::Headset;
-        s.via = L"2.4 GHz receiver";
-        s.percent = percent;
-        ctx.Add(s, kVid, pid);
-        break;
+// HIDV1 headsets: GET 68 (wireless link) and GET 49 (battery percent), one payload byte each.
+struct Hidv1Model { USHORT pid; int iface; USHORT page; const wchar_t* name; };  // page 0 = any collection
+constexpr Hidv1Model kHidv1Models[] = {
+    { 0x206B, 3, 0x0001, L"JBL Quantum 350 Wireless" },
+    { 0x205C, 5, 0, L"JBL Quantum 610 Wireless" },
+    { 0x2115, 5, 0x0001, L"JBL Quantum 360 Wireless" },
+};
+
+void PollHidv1(PollContext& ctx) {
+    for (const Hidv1Model& m : kHidv1Models) {
+        if (ctx.IsClaimed(kVid, m.pid)) continue;
+        for (const auto* c : ctx.Find(kVid, m.pid, [&m](const HidColl& c) {
+                 return c.iface == m.iface && c.featLen() >= 2 &&
+                        (m.page == 0 || (c.page() == m.page && c.usage() == 0));
+             })) {
+            HidDev d;
+            BYTE linked = 0, percent = 0;
+            if (!d.OpenReadOnly(*c) || !d.GetFeatureByte(0x68, linked) || linked != 1 ||
+                !d.GetFeatureByte(0x49, percent) || percent > 100) continue;
+            DeviceStatus s;
+            s.key = L"jbl:" + Hex4(m.pid);
+            s.name = m.name;
+            s.kind = DeviceKind::Headset;
+            s.via = L"2.4 GHz receiver";
+            s.percent = percent;
+            ctx.Add(s, kVid, m.pid);
+            break;
+        }
     }
 }
 
 }  // namespace
 
 void PollJbl(PollContext& ctx) {
-    PollQuantum350(ctx);
+    PollHidv1(ctx);
     for (const Model& m : kModels) {
         if (ctx.IsClaimed(kVid, m.pid)) continue;
         for (const HidColl* c : ctx.Find(kVid, m.pid, [](const HidColl& c) {

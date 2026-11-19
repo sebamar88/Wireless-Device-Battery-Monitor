@@ -42,6 +42,7 @@ PollContext Poll(std::vector<std::vector<BYTE>> data, USHORT pid = 0x1002) {
     return ctx;
 }
 }
+std::wstring Hex4(USHORT v) { wchar_t b[8]; swprintf(b, 8, L"%04X", v); return b; }  // used for the device key
 bool HidDev::OpenFeatureOnly(const HidColl& c) {
     ++opens;
     if (!openOk) return false;
@@ -94,6 +95,16 @@ int main() {
     assert(unpluggedAgain.out.empty());
     ctx = Poll({Reply(0x0B, 20), Reply(0x10, 1)});
     assert(ctx.out.size() == 1 && ctx.out[0].percent == 100 && ctx.out[0].charging);
+    // Moving the receiver to another USB port changes its HID path but not its key, and the
+    // "gone" entry for the old port is replaced instead of shown next to the new one.
+    std::wstring firstKey = ctx.out[0].key;
+    assert(firstKey == L"vaxee:1002");
+    replies = {Reply(0x0B, 19), Reply(0x10, 0)};
+    PollContext moved;
+    moved.colls = {Collection()};
+    moved.colls[0].path = L"test-other-port";
+    PollVaxee(moved);
+    assert(moved.out.size() == 1 && moved.out[0].connected && moved.out[0].key == firstKey);
     ctx = Poll({Reply(0x0B, 0)});
     assert(ctx.out.size() == 1 && ctx.out[0].percent == 0);
     ctx = Poll({Reply(0x0B, 21), Reply(0x0B, 7), Reply(0x10, 0)});

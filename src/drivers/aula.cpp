@@ -1,6 +1,11 @@
 // AULA F75 / F87 Pro / F99, MCHOSE (K99 V2, G75 Pro, X75 ...) and Redragon Horus Pro (K618RGB-PRO)
 // wireless keyboards on the "BY" 2.4 GHz receivers: 3554:FA09 (Compx, shared by these brands) and MCHOSE's
 // own 41E4:2001.
+// MCHOSE K87 / K99 receivers also come as 05AC:024F (Apple's vendor id), the id the SONiX dongles in
+// sonix.cpp use. M HUB lists 1452/591 among its devices; the MCHOSE ones are told apart by layout:
+// the BY collection on interface 1 (FF02:0002, 20-byte input and output reports) next to an
+// FF04:0002 feature collection, where the SONiX dongles only have FF60:0061 on interface 3.
+// Only that exact layout is probed on this id (issue #1417, MCHOSE K87).
 // The receiver exposes a 20-byte vendor collection (usage page FF02 or FF04, usage 02). Battery is a
 // 20-byte output report 0x13 carrying command 0x4A and a trailing sum checksum. The reply is
 // another 0x13 frame whose command byte, with its top bit masked, is 0x4A. Its payload starts at
@@ -21,7 +26,8 @@
 // (windows/l65w.ps1) and github.com/ushineko/sanshoku issue 36.
 // MCHOSE receiver ids, model codes and frames from the official M HUB web driver
 // (www.mchose.com.cn, assets/main-DQZs6ZzX.js: HidIndexDeviceFilters, getDevName, keyboardPwds,
-// getPassWord, getBattery, getBatteryParser), as also documented in
+// getPassWord, getBattery, getBatteryParser; vendorId 1452 / productId 591 with usage page FF00
+// or FF04, getDevName "K87" / "K99" on 591, wireless report id 19 = 0x13), as also documented in
 // github.com/wushuai0802/myfinder-device-battery (engine/upstream-protocols.md, sections
 // "MCHOSE BY keyboard receiver 3554:FA09" and "MCHOSE 41E4:2001 and other 41E4 identities").
 //
@@ -41,6 +47,25 @@
 //    is constant (it does not change with charging). The keyboard also pushes FE 05 <level> <flags>
 //    on its own. <flags> is 0x10 while charging on the cable and 0x00 on battery.
 // From a USB capture of AULA Hub (Wireless-Device-Battery-Monitor issue #201); read-only.
+//
+// AULA SC580 / SC580X mouse: USB cable 088D:062E, 2.4 GHz receiver 089D:062F. The vendor collection is
+// usage page FF02 / usage 0000 with 33-byte reports (report id 0 + 32-byte payload):
+//  * payload: [0] command, [1] status (0 in requests), [2] packets (01), [3] data length,
+//    [4..30] data, [31] = sum of bytes 4..30.
+//  * Command 0x30 (GetDeviceInfo, read-only) is what the vendor app polls for the battery. The reply
+//    echoes the command; status 0 OK, 1 busy (retry after 300 ms), 2 mouse offline (asleep or out of
+//    range of the receiver), 3 data error (retry). Reply data (from byte 4): "M137" identity,
+//    firmware (2), sensor id, unknown, charge state (0 on battery, 1 charging, 2 full), level 0..100,
+//    online flag.
+//  * sc580ctl notes that the receiver can answer a write with the reply to the previous write, so a reply
+//    to another command means "send again".
+//  * Observed on 089D:062F: the receiver answers 0x30 within a few ms from its own copy of the mouse
+//    state, and pushes D1 <online> <level> <charging> whenever the link goes down or comes back.
+//  * Observed with the cable in: the cable interface answers charge state 1 with level 100 regardless
+//    of the real charge, and the receiver reports the mouse offline (it switches to the wired link).
+// Protocol from github.com/Crucialjun/omarchy-aula-SC580 (PROTOCOL.md, bin/sc580ctl; MIT), reverse
+// engineered from the vendor's CBMouse.exe (class CDevDM, MS.ini Protocol=3) and verified on an SC580.
+// Tested here on an SC580 over the cable and the receiver.
 #include "drivers.h"
 
 #include <algorithm>
@@ -53,7 +78,24 @@ namespace {
 struct Receiver {
     USHORT vid, pid;
 };
-const Receiver kReceivers[] = { { 0x3554, 0xFA09 }, { 0x3554, 0xFB40 }, { 0x41E4, 0x2001 } };
+const Receiver kReceivers[] = { { 0x3554, 0xFA09 }, { 0x3554, 0xFB40 }, { 0x41E4, 0x2001 }, { 0x05AC, 0x024F } };
+
+// 05AC:024F is shared with the SONiX dongles (sonix.cpp), so only the MCHOSE layout is accepted there.
+bool IsAppleId(USHORT vid, USHORT pid) { return vid == 0x05AC && pid == 0x024F; }
+
+bool IsByCollection(const HidColl& c) {
+    if (!IsAppleId(c.vid, c.pid))
+        return (c.page() == 0xFF02 || c.page() == 0xFF04) && c.usage() == 0x0002 && c.outLen() >= 20 && c.inLen() >= 20;
+    return c.iface == 1 && c.page() == 0xFF02 && c.usage() == 0x0002 && c.inLen() == 20 && c.outLen() == 20;
+}
+
+// The MCHOSE 05AC:024F receiver also has the FF04:0002 feature collection on interface 1.
+bool HasMchoseLayout(const PollContext& ctx, USHORT vid, USHORT pid) {
+    return !ctx.Find(vid, pid, [](const HidColl& c) {
+                   return c.iface == 1 && c.page() == 0xFF04 && c.usage() == 0x0002 && c.featLen() > 0 &&
+                          c.inLen() == 0 && c.outLen() == 0;
+               }).empty();
+}
 
 // M HUB's keyboardPwds table: the six-byte model code returned by command 0x05.
 struct Model {
@@ -319,9 +361,120 @@ constexpr ULONGLONG kBackoffAfterMs = 5 * 60 * 1000;  // keep asking for 5 minut
 constexpr ULONGLONG kFirstBackoffMs = 5 * 60 * 1000;
 constexpr ULONGLONG kMaxBackoffMs = 60 * 60 * 1000;
 
+// --- SC580 / SC580X mouse (cable 088D:062E, receiver 089D:062F) ---
+
+struct MouseId {
+    USHORT vid, pid;
+    bool cable;
+};
+const MouseId kSc580[] = { { 0x088D, 0x062E, true }, { 0x089D, 0x062F, false } };
+
+constexpr BYTE kScGetInfo = 0x30;
+constexpr BYTE kScOk = 0, kScBusy = 1, kScOffline = 2, kScDataError = 3;
+constexpr int kScDeadlineMs = 1000;  // the cable answers within a few ms, the receiver within ~100 ms
+constexpr int kScResendMs = 250;
+
+enum class ScResult { Ok, Offline, Failed };
+
+// Sends 30 00 01 00 ... and waits for an OK reply, resending on busy / stale replies within one deadline.
+ScResult Sc580Info(HidDev& d, std::vector<BYTE>& data) {
+    std::vector<BYTE> req(33, 0);  // report id 0 + 32-byte payload; the checksum over empty data is 0
+    req[1] = kScGetInfo;
+    req[3] = 0x01;
+    const ULONGLONG end = GetTickCount64() + kScDeadlineMs;
+    auto left = [&] { return (int)std::max<LONGLONG>((LONGLONG)end - (LONGLONG)GetTickCount64(), 0); };
+    d.Flush();
+    std::vector<BYTE> r;
+    while (left() > 0) {
+        if (!d.Write(req)) return ScResult::Failed;
+        ULONGLONG resendAt = GetTickCount64() + kScResendMs;
+        bool resend = false;
+        while (!resend) {
+            int wait = (int)std::min<LONGLONG>((LONGLONG)resendAt - (LONGLONG)GetTickCount64(), left());
+            if (wait <= 0) break;
+            ULONGLONG before = GetTickCount64();
+            int n = d.Read(r, wait);
+            // A read that fails at once is an I/O error (device unplugged), not a timeout: stop.
+            if (n < 0 && (int)(GetTickCount64() - before) + 20 < wait) return ScResult::Failed;
+            if (n < 32) continue;
+            if (r[0] == 0xD1 || r[0] == 0xD2) continue;  // pushed power / DPI notifications
+            if (r[0] != kScGetInfo) {                   // the receiver's reply to an earlier request
+                resend = true;
+                continue;
+            }
+            switch (r[1]) {
+            case kScOk:
+                if (r[31] != SumRange(r, 4, 31)) continue;
+                data.assign(r.begin() + 4, r.begin() + 31);
+                return ScResult::Ok;
+            case kScOffline:
+                return ScResult::Offline;
+            case kScBusy:
+                Sleep((DWORD)std::min(300, left()));
+                resend = true;
+                break;
+            case kScDataError:
+            default:
+                resend = true;
+                break;
+            }
+        }
+    }
+    return ScResult::Failed;
+}
+
+void PollSc580(PollContext& ctx) {
+    const std::wstring key = L"aula:sc580";  // one entry when the mouse charges on the cable next to its receiver
+    for (const auto& m : kSc580) {
+        if (ctx.IsClaimed(m.vid, m.pid)) continue;
+        bool listed = false;
+        for (const auto& o : ctx.out) listed |= o.key == key;
+        if (listed) {  // the cable answered first: leave the receiver alone
+            ctx.Claim(m.vid, m.pid);
+            continue;
+        }
+        for (const HidColl* c : ctx.Find(m.vid, m.pid, [](const HidColl& c) {
+                 return c.page() == 0xFF02 && c.usage() == 0x0000 && c.outLen() >= 33 && c.inLen() >= 33;
+             })) {
+            HidDev d;
+            if (!d.Open(*c)) continue;
+            std::vector<BYTE> data;
+            ScResult res = Sc580Info(d, data);
+            if (res == ScResult::Failed) continue;
+            ctx.Claim(m.vid, m.pid);
+            // The receiver answers status 2 (and pushes D1 00) as soon as the mouse dozes (seen 20-60 s after
+            // it was last moved) or is switched off, and status 0 again right after it wakes. That is reported as an
+            // asleep entry so the tray keeps the last level: leaving it out made the mouse disappear once
+            // graceSec ran out, e.g. after the PC spent longer than that in Modern Standby.
+            bool offline = res == ScResult::Offline || data[10] == 0;
+            if (!offline && data[9] > 100) break;
+            DeviceStatus s;
+            s.key = key;
+            s.name = L"AULA SC580";
+            s.kind = DeviceKind::Mouse;
+            s.via = m.cable ? L"USB cable" : L"2.4 GHz receiver";
+            if (offline) {
+                s.asleep = true;
+            } else if (data[8] == 1) {
+                // While charging the mouse reports a fixed 100 (seen going 89 -> 100 the moment the cable
+                // went in, and back to 94 when it came out), so the level is unknown: the tray shows the
+                // last real level with the charging mark. Charge state 2 (full) keeps its 100.
+                s.charging = true;
+            } else {
+                s.percent = data[9];
+            }
+            s.graceSec = 1800;  // only used when the receiver stops answering altogether
+            ctx.out.push_back(s);
+            break;
+        }
+    }
+}
+
 }  // namespace
 
 void PollAula(PollContext& ctx) {
+    PollSc580(ctx);
+
     static ReceiverState states[std::size(kReceivers)];
     for (size_t i = 0; i < std::size(kReceivers); i++) {
         USHORT vid = kReceivers[i].vid, pid = kReceivers[i].pid;
@@ -330,18 +483,18 @@ void PollAula(PollContext& ctx) {
         if (ctx.IsClaimed(vid, pid)) continue;
         if (!st.answered && st.nextTry && GetTickCount64() < st.nextTry) continue;
         bool tried = false, answered = false;
-        for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) {
-                 return (c.page() == 0xFF02 || c.page() == 0xFF04) && c.usage() == 0x0002 && c.outLen() >= 20 &&
-                        c.inLen() >= 20;
-             })) {
+        if (IsAppleId(vid, pid) && !HasMchoseLayout(ctx, vid, pid)) continue;  // a SONiX dongle: sonix.cpp
+        for (const HidColl* c : ctx.Find(vid, pid, IsByCollection)) {
             HidDev d;
             if (!d.Open(*c)) continue;
-            // Only the generic receiver names carry a model code (M HUB asks no other device).
+            // The generic receiver names carry a model code (M HUB asks no other 3554 / 41E4 device).
             std::wstring product = HidProduct(*c);
             bool generic = product.find(L"2.4G Wireless Receiver") != std::wstring::npos ||
                            product.find(L"MCHOSE 2.4G Wireless") != std::wstring::npos;
-            const wchar_t* model = generic ? IdentifyModel(d) : nullptr;
-            bool mchose = vid == 0x41E4 || model != nullptr;
+            // M HUB names a 05AC:024F keyboard from its product string ("K87", "K99"), so ask for the
+            // model code there whatever the name is.
+            const wchar_t* model = generic || IsAppleId(vid, pid) ? IdentifyModel(d) : nullptr;
+            bool mchose = vid == 0x41E4 || IsAppleId(vid, pid) || model != nullptr;
             std::vector<BYTE> r;
             tried = true;
             // Byte 2 alternates 00 / 01 on resends; M HUB sends 01, the AULA references 00.
@@ -351,7 +504,12 @@ void PollAula(PollContext& ctx) {
             answered = true;
             DeviceStatus s;
             s.key = L"aula:" + Hex4(vid) + L":" + Hex4(pid);
-            s.name = model ? model : mchose ? L"MCHOSE wireless keyboard" : L"AULA wireless keyboard";
+            if (model)
+                s.name = model;
+            else if (IsAppleId(vid, pid) && !generic && !product.empty())
+                s.name = product;  // a product string that names the keyboard, as M HUB's getDevName uses
+            else
+                s.name = mchose ? L"MCHOSE wireless keyboard" : L"AULA wireless keyboard";
             s.kind = DeviceKind::Keyboard;
             s.via = L"2.4 GHz receiver";
             s.percent = level;

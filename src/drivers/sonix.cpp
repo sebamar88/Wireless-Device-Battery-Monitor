@@ -1,16 +1,23 @@
 // SONiX keyboards on their 2.4 GHz dongle: AJAZZ AK820 MAX ("AJAZZ AK820 MAX 2.4G", 05AC:024F, tested),
-// AULA F108 Pro (same 05AC:024F dongle) and AJAZZ AK980 V2 (0C45:FEFE). The dongle reuses Apple's
-// vendor id, so it is also matched by its vendor collection: interface 3, usage page FF60 / usage 61,
-// 33-byte input and output reports (report id 0 + 32 bytes).
+// AULA F108 Pro (same 05AC:024F dongle), AJAZZ AK980 V2 (0C45:FEFE) and AJAZZ AK820 Pro (0C45:FDFD,
+// some units ship a 0C45:FEFE "2.4G Dongle"). The 05AC dongle reuses Apple's vendor id, so the dongles
+// are also matched by their vendor collection: interface 3, usage page FF60 / usage 61, 33-byte input
+// and output reports (report id 0 + 32 bytes).
 //   request [20 01 00 ... sum]          sum = byte sum of the 31 bytes before it
-//   reply   [20 01 00 level ... sum]    level in percent; same checksum
-// The keyboard only reports its level while it is switched to 2.4G mode. The protocol is read-only.
-// From github.com/donglover69/sonix-keyboard-studio (README, "2.4G dongles").
+//   reply   [20 01 00 level ...]        level in percent
+// A reply is recognised by its first three bytes (the echoed command), as the AK820 Pro tools do; its
+// checksum is not checked. The keyboard only reports its level while it is switched to 2.4G mode.
+// The protocol is read-only.
+// MCHOSE K87 receivers on the same 05AC:024F id expose a different layout (the BY collection on
+// interface 1, no FF60 on interface 3); aula.cpp runs first and reads those.
+// From github.com/donglover69/sonix-keyboard-studio (README, "2.4G dongles"); the AK820 Pro receiver
+// 0C45:FDFD and the echo match from github.com/deddroid/ak820-rs (src/device.rs, src/protocol.rs) and
+// github.com/usharik/ak820-studio (Sources/AK820Kit/Keyboard.swift).
 #include "drivers.h"
 
 namespace {
 
-const std::pair<USHORT, USHORT> kDongles[] = { { 0x05AC, 0x024F }, { 0x0C45, 0xFEFE } };
+const std::pair<USHORT, USHORT> kDongles[] = { { 0x05AC, 0x024F }, { 0x0C45, 0xFEFE }, { 0x0C45, 0xFDFD } };
 
 const size_t kLen = 32;  // payload bytes after the report id; the last one is the checksum
 
@@ -35,8 +42,7 @@ int QueryLevel(HidDev& d) {
         std::vector<BYTE> r;
         int n = d.Read(r, left);  // report id 0 is stripped: r[0] is the first payload byte
         if (n < 0) return -1;
-        if (n < (int)kLen || r[0] != 0x20 || r[1] != 0x01) continue;
-        if (r[kLen - 1] != Sum(r, 0, kLen - 1)) continue;
+        if (n < 4 || r[0] != 0x20 || r[1] != 0x01 || r[2] != 0x00) continue;
         return r[3];
     }
 }

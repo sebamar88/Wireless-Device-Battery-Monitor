@@ -71,6 +71,7 @@ int PollWgi(PollContext& ctx, int& thirdParty) {
         UINT16 vid = 0, pid = 0;
         raw->get_HardwareVendorId(&vid);
         raw->get_HardwareProductId(&pid);
+        if (ctx.IsClaimed(vid, pid)) { Release(raw); continue; }  // a vendor driver already reads this pad
         IGameControllerBatteryInfo* info = nullptr;
         IBatteryReport* report = nullptr;
         if (WgiVendor(vid) && SUCCEEDED(raw->QueryInterface(__uuidof(IGameControllerBatteryInfo), (void**)&info)) && info &&
@@ -121,8 +122,11 @@ int PollWgi(PollContext& ctx, int& thirdParty) {
 
 using GetBatteryFn = DWORD(WINAPI*)(DWORD, BYTE, XINPUT_BATTERY_INFORMATION*);
 using GetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+// Undocumented xinput1_4 export (ordinal 108): capabilities plus the pad's USB vendor / product id.
+struct XInputCapsEx { XINPUT_CAPABILITIES caps; WORD vid, pid, version, unk1; DWORD unk2; };
+using GetCapsExFn = DWORD(WINAPI*)(DWORD, DWORD, DWORD, XInputCapsEx*);
 
-struct XInputApi { GetBatteryFn battery = nullptr; GetStateFn state = nullptr; };
+struct XInputApi { GetBatteryFn battery = nullptr; GetStateFn state = nullptr; GetCapsExFn capsEx = nullptr; };
 
 const XInputApi& LoadXInput() {
     static XInputApi api = [] {
@@ -131,6 +135,7 @@ const XInputApi& LoadXInput() {
             if (HMODULE m = LoadLibraryExW(dll, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
                 a.battery = (GetBatteryFn)GetProcAddress(m, "XInputGetBatteryInformation");
                 a.state = (GetStateFn)GetProcAddress(m, "XInputGetState");
+                a.capsEx = (GetCapsExFn)GetProcAddress(m, MAKEINTRESOURCEA(108));
                 if (a.battery && a.state) break;
             }
         }
@@ -163,6 +168,10 @@ void PollXInput(PollContext& ctx) {
         // showed up as four "Medium" headsets), so only look at slots with a controller connected.
         XINPUT_STATE state{};
         if (api.state(user, &state) != ERROR_SUCCESS) continue;
+        // Pads a vendor driver already reads (e.g. the GameSir Cyclone Pro dongle, which XInput
+        // reports as a "Full" Xbox 360 pad) are skipped.
+        XInputCapsEx cx{};
+        if (api.capsEx && api.capsEx(1, user, 0, &cx) == ERROR_SUCCESS && cx.vid && ctx.IsClaimed(cx.vid, cx.pid)) continue;
         XINPUT_BATTERY_INFORMATION pad{};
         const bool hasPad = query(user, BATTERY_DEVTYPE_GAMEPAD, pad);
         for (BYTE type : { (BYTE)BATTERY_DEVTYPE_GAMEPAD, (BYTE)BATTERY_DEVTYPE_HEADSET }) {

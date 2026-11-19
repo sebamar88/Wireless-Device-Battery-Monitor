@@ -13,6 +13,7 @@ struct WidgetItem {
     int  percent  = -1;     // -1 = unknown
     std::wstring text;      // shown instead of the percentage when set (coarse levels like "Low")
     bool charging = false;
+    bool full     = false;  // on power and fully charged: a green check mark instead of the bolt
     bool dim      = false;  // asleep / stale value
     bool low      = false;
     bool bluetooth = false;  // picks the Bluetooth icon when the device type is unknown

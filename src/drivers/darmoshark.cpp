@@ -75,7 +75,7 @@ void PollModel(PollContext& ctx, const Model& model) {
         if (percent < 0) continue;
 
         DeviceStatus status;
-        status.key = L"darmoshark:" + coll->path;
+        status.key = ctx.StableKey(L"darmoshark:" + Hex4(model.receiver));
         status.name = model.name;
         status.kind = DeviceKind::Mouse;
         status.via = L"2.4 GHz receiver";
@@ -89,5 +89,68 @@ void PollModel(PollContext& ctx, const Model& model) {
 void PollDarmoshark(PollContext& ctx) {
     for (const auto& model : kModels) {
         PollModel(ctx, model);
+    }
+}
+
+// Darmoshark M3S Pro on its Nordic "1K NRF Receiver" (1915:0723), verified on hardware.
+// Protocol read from a USB capture of Darmoshark's software. Vendor collection: interface 3,
+// usage page FF0A, 64-byte reports without a report id. All 64 bytes of a frame sum to 0xA1 (mod 256).
+//   Request  [41][00][81][01] 0 ... [csum]
+//   Reply    [41][00][8C][01][..][..][percent] ...
+namespace {
+constexpr USHORT kNrfVid = 0x1915;
+constexpr USHORT kNrfReceiver = 0x0723;
+constexpr size_t kNrfFrame = 64;
+constexpr BYTE kNrfSum = 0xA1;
+constexpr ULONGLONG kNrfTimeoutMs = 600;
+
+BYTE NrfChecksum(const std::vector<BYTE>& frame) {
+    unsigned sum = 0;
+    for (size_t i = 0; i + 1 < kNrfFrame; ++i) sum += frame[i];
+    return static_cast<BYTE>((kNrfSum - sum) & 0xFF);
+}
+
+bool NrfReadBattery(HidDev& device, int& percent) {
+    std::vector<BYTE> request(kNrfFrame + 1, 0);  // [0] = report id 0
+    request[1] = 0x41;
+    request[3] = 0x81;
+    request[4] = 0x01;
+    request[kNrfFrame] = NrfChecksum(std::vector<BYTE>(request.begin() + 1, request.end()));
+
+    device.Flush();
+    if (!device.Write(request)) return false;
+
+    const auto deadline = GetTickCount64() + kNrfTimeoutMs;
+    std::vector<BYTE> reply;
+    for (auto now = GetTickCount64(); now < deadline; now = GetTickCount64()) {
+        const auto waitMs = static_cast<int>((std::min)(100ULL, deadline - now));
+        if (device.Read(reply, waitMs) < static_cast<int>(kNrfFrame)) continue;
+        if (reply[0] != 0x41 || reply[2] != 0x8C || reply[3] != 0x01) continue;
+        if (reply[kNrfFrame - 1] != NrfChecksum(reply) || reply[6] > 100) continue;
+        percent = reply[6];
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+void PollDarmosharkNrf(PollContext& ctx) {
+    if (ctx.IsClaimed(kNrfVid, kNrfReceiver)) return;
+    for (const HidColl* coll : ctx.Find(kNrfVid, kNrfReceiver, [](const HidColl& c) {
+             return c.iface == 3 && c.page() == 0xFF0A && c.usage() == 1 &&
+                    c.inLen() == 65 && c.outLen() == 65;
+         })) {
+        HidDev device;
+        int percent = 0;
+        if (!device.Open(*coll) || !NrfReadBattery(device, percent)) continue;
+
+        DeviceStatus status;
+        status.key = L"darmoshark:" + Hex4(kNrfVid) + L":" + Hex4(kNrfReceiver);
+        status.name = L"Darmoshark M3S Pro";
+        status.kind = DeviceKind::Mouse;
+        status.via = L"2.4 GHz receiver";
+        status.percent = percent;
+        ctx.Add(status, kNrfVid, kNrfReceiver);
+        return;
     }
 }

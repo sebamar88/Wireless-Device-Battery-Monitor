@@ -115,6 +115,37 @@ int main() {
     assert(ctx.out.size() == 1 && ctx.out[0].key == L"rapoo:4433");
     assert(ctx.out[0].charging && ctx.out[0].percent == 95 && ctx.out[0].via == L"USB cable");
 
+    // VT3 Pro Max 24AE:1244, reported in #2258 (synthetic BB B0 test frames based
+    // on the documented protocol, not a capture from the issue reporter).
+    ctx = {};
+    ctx.colls = { Collection(0x1244, L"vt3-pro-max", 7),
+                  Collection(0x1244, L"vt3-pro-max-10", 10) };
+    reports = { { L"vt3-pro-max", { { 0xBB, 0xB0, 0x81, 0x20, 0x03, 0x01, 45 } } },
+                { L"vt3-pro-max-10", { { 0xBC, 0xB0, 0, 0, 0, 0, 0, 0, 0, 0 } } } };
+    opens = 0;
+    PollRapoo(ctx);
+    assert(opens == 1); // the 10-byte sibling is not a battery report endpoint
+    assert(ctx.out.size() == 1 && ctx.out[0].key == L"rapoo:1244");
+    assert(ctx.out[0].name == L"Rapoo VT3 Pro Max");
+    assert(ctx.out[0].percent == 45 && !ctx.out[0].charging);
+    assert(ctx.out[0].via == L"2.4 GHz receiver");
+    assert(ctx.IsClaimed(0x24AE, 0x1244));
+
+    // Charging with 7F means unknown percentage, never 127%.
+    ctx = {};
+    ctx.colls = { Collection(0x1244, L"vt3-pro-max", 7) };
+    reports = { { L"vt3-pro-max", { { 0xBB, 0xB0, 0x81, 0x20, 0x03, 0x02, 0x7F } } } };
+    PollRapoo(ctx);
+    assert(ctx.out.size() == 1 && ctx.out[0].charging && ctx.out[0].percent == -1);
+
+    // Never try the legacy decoder on a nearby, undocumented PID.
+    ctx = {};
+    ctx.colls = { Collection(0x1245, L"unknown-1245", 7) };
+    reports = { { L"unknown-1245", { { 0xBB, 0xB0, 0x81, 0x20, 0x03, 0x01, 45 } } } };
+    opens = 0;
+    PollRapoo(ctx);
+    assert(opens == 0 && ctx.out.empty() && ctx.claimed.empty());
+
     // The same marker does not select legacy semantics on a modern Nordic collection.
     ctx = {};
     ctx.colls = { receiver };

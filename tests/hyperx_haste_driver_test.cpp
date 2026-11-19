@@ -137,6 +137,9 @@ int main() {
     assert(ctx.out.size() == 1 && ctx.out[0].name == L"HyperX Pulsefire Haste 2 Wireless");
     assert(ctx.out[0].kind == DeviceKind::Mouse && ctx.out[0].percent == 86 && ctx.out[0].charging);
     assert(ctx.IsClaimed(0x03F0, 0x0F98));
+    ctx = Poll(Collection(0x0DA0, 0xFF90), Dongle(Link(1), Battery(21)));
+    assert(ctx.out.size() == 1 && ctx.out[0].key == L"hyperx:0DA0" && ctx.out[0].name == L"HyperX Pulsefire Haste 2 Mini" &&
+           ctx.out[0].percent == 21);
 
     // No reply at all (dongle without a mouse): nothing listed, nothing claimed.
     ctx = Poll(core, {});

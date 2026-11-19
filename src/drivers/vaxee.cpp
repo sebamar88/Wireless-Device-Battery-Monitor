@@ -2,6 +2,7 @@
 // https://github.com/stuffz/mouse-battery-monitor/blob/main/docs/VAXEE.md
 // Only battery (0B) and charging (10) reads are sent; never configuration writes.
 #include "drivers.h"
+#include <algorithm>
 #include <map>
 
 namespace {
@@ -60,7 +61,11 @@ void PollVaxee(PollContext& ctx) {
                 valid = Query(d, 0x0B, battery) && battery <= 20;
             if (!valid) continue;  // UI keeps the last reading dimmed during the grace period.
             DeviceStatus s;
-            s.key = L"vaxee:" + c->path;
+            // A "gone" entry pushed above for the same mouse on its old port is replaced, not duplicated.
+            s.key = ctx.StableKey(L"vaxee:" + Hex4(pid));
+            ctx.out.erase(std::remove_if(ctx.out.begin(), ctx.out.end(), [&](const DeviceStatus& o) {
+                              return o.key == s.key && !o.connected;
+                          }), ctx.out.end());
             s.name = pid == kCable        ? L"ZYGEN NP-01S V2 Wireless"
                      : pid == kReceiver8K ? L"VAXEE 8K Wireless"
                                           : L"VAXEE wireless mouse";

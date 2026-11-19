@@ -13,19 +13,16 @@
 //       (bit 3 is always set on AirPods Max: 0x80 discharging, 0x90 charging); low nibble: case level
 // (layout from OpenPods / MagicPodsCore / AirPodsDesktop / librepods, verified on AirPods Max 200A).
 //
-// A BluetoothLEAdvertisementWatcher (WinRT) is started the first time a paired Apple audio device
-// is seen and keeps running. Nearby AirPods of other people broadcast the same message with random
+// The shared BLE advertisement watcher (ble_adverts.cpp) is started the first time a paired Apple
+// audio device is seen and keeps running. Nearby AirPods of other people broadcast the same message with random
 // addresses, so only messages whose model matches the PID of a paired device are used, and the
 // strongest recent signal wins.
 #include "drivers.h"
+#include "ble_adverts.h"
 
 #include <setupapi.h>
 #include <initguid.h>
 #include <devpkey.h>
-#include <eventtoken.h>
-#include <inspectable.h>
-#include <roapi.h>
-#include <winstring.h>
 
 #include <algorithm>
 #include <cwchar>
@@ -33,93 +30,7 @@
 #include <set>
 #include <vector>
 
-// ---- minimal WinRT ABI declarations (MinGW ships no windows.devices.bluetooth.advertisement.h) ----
-// Vtable order from the Windows SDK header windows.devices.bluetooth.advertisement.h.
-// Deliberately NOT in an anonymous namespace: GCC would see interfaces nobody in the program can
-// implement and turn every call through them into a trap (-fdevirtualize, at -O1 and above).
-namespace airpods_abi {
-
-const GUID IID_Watcher = { 0xa6ac336f, 0xf3d3, 0x4297, { 0x8d, 0x6c, 0xc8, 0x1e, 0xa6, 0x62, 0x3f, 0x40 } };
-const GUID IID_ReceivedArgs = { 0x27987ddf, 0xe596, 0x41be, { 0x8d, 0x43, 0x9e, 0x67, 0x31, 0xd4, 0xa9, 0x13 } };
-// ITypedEventHandler<BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementReceivedEventArgs>
-const GUID IID_ReceivedHandler = { 0x90eb4eca, 0xd465, 0x5ea0, { 0xa6, 0x1c, 0x03, 0x3c, 0x8c, 0x5e, 0xce, 0xf2 } };
-const GUID IID_BufferByteAccess = { 0x905a0fef, 0xbc53, 0x11df, { 0x8c, 0x49, 0x00, 0x1e, 0x4f, 0xc6, 0x86, 0xda } };
-const GUID IID_Unknown = { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
-const GUID IID_Agile = { 0x94ea2b94, 0xe9cc, 0x49e0, { 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 } };
-
-struct IBufferAbi : IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_Capacity(UINT32* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_Length(UINT32* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_Length(UINT32 v) = 0;
-};
-
-struct IBufferByteAccessAbi : IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE Buffer(BYTE** v) = 0;
-};
-
-struct IManufacturerData : IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_CompanyId(UINT16* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_CompanyId(UINT16 v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_Data(IBufferAbi** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_Data(IBufferAbi* v) = 0;
-};
-
-struct IManufacturerDataView : IInspectable {  // IVectorView<BluetoothLEManufacturerData>
-    virtual HRESULT STDMETHODCALLTYPE GetAt(UINT32 i, IManufacturerData** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_Size(UINT32* v) = 0;
-};
-
-struct IAdvertisement : IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_Flags(IInspectable** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_Flags(IInspectable* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_LocalName(HSTRING* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_LocalName(HSTRING v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_ServiceUuids(IInspectable** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_ManufacturerData(IInspectable** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_DataSections(IInspectable** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetManufacturerDataByCompanyId(UINT16 company, IManufacturerDataView** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE GetSectionsByType(BYTE type, IInspectable** v) = 0;
-};
-
-struct IReceivedArgs : IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_RawSignalStrengthInDBm(INT16* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_BluetoothAddress(UINT64* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_AdvertisementType(INT32* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_Timestamp(INT64* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_Advertisement(IAdvertisement** v) = 0;
-};
-
-struct IWatcher : IInspectable {
-    virtual HRESULT STDMETHODCALLTYPE get_MinSamplingInterval(INT64* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_MaxSamplingInterval(INT64* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_MinOutOfRangeTimeout(INT64* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_MaxOutOfRangeTimeout(INT64* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_Status(INT32* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_ScanningMode(INT32* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_ScanningMode(INT32 v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_SignalStrengthFilter(IInspectable** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_SignalStrengthFilter(IInspectable* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE get_AdvertisementFilter(IInspectable** v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE put_AdvertisementFilter(IInspectable* v) = 0;
-    virtual HRESULT STDMETHODCALLTYPE Start() = 0;
-    virtual HRESULT STDMETHODCALLTYPE Stop() = 0;
-    virtual HRESULT STDMETHODCALLTYPE add_Received(IUnknown* handler, EventRegistrationToken* token) = 0;
-    virtual HRESULT STDMETHODCALLTYPE remove_Received(EventRegistrationToken token) = 0;
-};
-
-}  // namespace airpods_abi
-
 namespace {
-
-using namespace airpods_abi;
-
-enum { kWatcherStopped = 3, kWatcherAborted = 4 };
-
-template <class T>
-void Release(T*& p) {
-    if (p) p->Release();
-    p = nullptr;
-}
 
 // ---- received messages -------------------------------------------------------------------------
 
@@ -201,97 +112,6 @@ bool Parse(const BYTE* buf, UINT32 n, Advert& a) {
         if (type == 0x07 && ParseProximityTlv(buf + i, 2 + (UINT32)len, a)) return true;
         i += 2 + (UINT32)len;
     }
-    return false;
-}
-
-void OnReceived(IReceivedArgs* args) {
-    IAdvertisement* adv = nullptr;
-    IManufacturerDataView* view = nullptr;
-    if (FAILED(args->get_Advertisement(&adv)) || !adv) return;
-    if (SUCCEEDED(adv->GetManufacturerDataByCompanyId(0x004C, &view)) && view) {
-        UINT32 count = 0;
-        view->get_Size(&count);
-        for (UINT32 i = 0; i < count; i++) {
-            IManufacturerData* md = nullptr;
-            IBufferAbi* buf = nullptr;
-            IBufferByteAccessAbi* bytes = nullptr;
-            BYTE* p = nullptr;
-            UINT32 len = 0;
-            Advert a;
-            if (SUCCEEDED(view->GetAt(i, &md)) && md && SUCCEEDED(md->get_Data(&buf)) && buf && SUCCEEDED(buf->get_Length(&len)) &&
-                SUCCEEDED(buf->QueryInterface(IID_BufferByteAccess, (void**)&bytes)) && bytes && SUCCEEDED(bytes->Buffer(&p)) && p &&
-                Parse(p, len, a)) {
-                UINT64 addr = 0;
-                INT16 rssi = -127;
-                args->get_BluetoothAddress(&addr);
-                args->get_RawSignalStrengthInDBm(&rssi);
-                a.rssi = rssi;
-                a.tick = GetTickCount64();
-                AcquireSRWLockExclusive(&g_lock);
-                g_adverts[addr] = a;
-                for (auto it = g_adverts.begin(); it != g_adverts.end();)  // addresses rotate: drop old ones
-                    it = a.tick - it->second.tick > 10 * 60 * 1000 ? g_adverts.erase(it) : std::next(it);
-                ReleaseSRWLockExclusive(&g_lock);
-            }
-            Release(bytes);
-            Release(buf);
-            Release(md);
-        }
-    }
-    Release(view);
-    Release(adv);
-}
-
-// Static delegate object: lives as long as the process.
-struct ReceivedHandler : IUnknown {
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
-        if (iid == IID_Unknown || iid == IID_ReceivedHandler || iid == IID_Agile) {
-            *out = this;
-            return S_OK;
-        }
-        *out = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
-    virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable* /*sender*/, IInspectable* argsObj) {
-        IReceivedArgs* args = nullptr;
-        if (argsObj && SUCCEEDED(argsObj->QueryInterface(IID_ReceivedArgs, (void**)&args)) && args) {
-            OnReceived(args);
-            args->Release();
-        }
-        return S_OK;
-    }
-};
-
-ReceivedHandler g_handler;
-IWatcher* g_watcher = nullptr;
-
-// Starts (or restarts after the radio was switched off) the watcher. Returns true if it was just started.
-bool EnsureWatcher() {
-    if (!g_watcher) {
-        RoInitialize(RO_INIT_MULTITHREADED);  // our poll thread; harmless if already initialised
-        const wchar_t* cls = L"Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher";
-        HSTRING name = nullptr;
-        IInspectable* obj = nullptr;
-        if (SUCCEEDED(WindowsCreateString(cls, (UINT32)wcslen(cls), &name))) {
-            RoActivateInstance(name, &obj);
-            WindowsDeleteString(name);
-        }
-        if (!obj) return false;
-        obj->QueryInterface(IID_Watcher, (void**)&g_watcher);
-        obj->Release();
-        if (!g_watcher) return false;
-        EventRegistrationToken tok;
-        if (FAILED(g_watcher->add_Received(&g_handler, &tok))) {
-            Release(g_watcher);
-            return false;
-        }
-        return SUCCEEDED(g_watcher->Start());
-    }
-    INT32 st = 0;
-    if (SUCCEEDED(g_watcher->get_Status(&st)) && (st == kWatcherStopped || st == kWatcherAborted))
-        return SUCCEEDED(g_watcher->Start());
     return false;
 }
 
@@ -396,10 +216,22 @@ std::wstring Pct(int v) { return v < 0 ? L"?" : std::to_wstring(v) + L"%"; }
 
 }  // namespace
 
+void AirPodsOnAdvert(UINT64 addr, int rssi, const BYTE* data, UINT32 len) {
+    Advert a;
+    if (!Parse(data, len, a)) return;
+    a.rssi = rssi;
+    a.tick = GetTickCount64();
+    AcquireSRWLockExclusive(&g_lock);
+    g_adverts[addr] = a;
+    for (auto it = g_adverts.begin(); it != g_adverts.end();)  // addresses rotate: drop old ones
+        it = a.tick - it->second.tick > 10 * 60 * 1000 ? g_adverts.erase(it) : std::next(it);
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
 void PollAirPods(PollContext& ctx) {
     auto devices = PairedAppleAudio();
     if (devices.empty()) return;
-    if (EnsureWatcher()) {
+    if (EnsureBleWatcher()) {
         // Just started: give the headphones a moment to broadcast (about once every 1-2 s).
         for (int i = 0; i < 15; i++) {
             Advert a;

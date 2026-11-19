@@ -60,7 +60,7 @@ void PollModel(PollContext& ctx, const Model& m) {
         const int connection = r[6];
         if (modern ? (connection > 1) : (connection != 1 && connection != 2)) continue;
         DeviceStatus s;
-        s.key = L"flydigi:" + c->path;
+        s.key = ctx.StableKey(L"flydigi:" + Hex4(m.pid));
         s.name = m.name;
         s.kind = DeviceKind::Gamepad;
         s.via = connection == (modern ? 1 : 2) ? L"2.4 GHz receiver" : L"USB cable";

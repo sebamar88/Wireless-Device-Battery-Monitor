@@ -91,6 +91,8 @@ void PollRongyuan(PollContext& ctx) {
                 if (vid == 0x3151 && pid == 0x402D && !keyboard && !otherBrand) s.name = L"Attack Shark R3";
                 else if (vid == 0x3151 && pid == 0x5038 && keyboard) s.name = L"MonsGeek keyboard";  // receiver says "MonsGeek 2.4G Wireless Keyboard"
                 else if (generic && !brand.empty()) s.name = brand + (keyboard ? L" wireless keyboard" : L" wireless mouse");
+                else if (vid == 0x3151 && pid == 0x5006 && keyboard && product.find(L"Akko") != std::wstring::npos)
+                    s.name = L"Akko Air 01";
                 else if (generic) s.name = keyboard ? L"Wireless keyboard" : L"Wireless mouse";
                 else s.name = product;
                 s.kind = keyboard ? DeviceKind::Keyboard : DeviceKind::Mouse;

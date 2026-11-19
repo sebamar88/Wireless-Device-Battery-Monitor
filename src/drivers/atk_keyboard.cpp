@@ -1,9 +1,16 @@
-// ATK V75X keyboard on its 2.4 GHz receiver (320F:5088) or its USB cable (320F:5055).
-// Ported from HaloBattery (github.com/HeyOkay/HaloBattery, providers/atk_keyboard.py, MIT; confirmed there by
-// its author on both), from ATK HUB 3.2.29's Evision keyboard driver (keyboard-info.util-*.js).
-//   Output report 04 on FF1C:0092, 31 payload bytes: [04][seq lo][seq hi][1A][00 ...]
+// Evision keyboards on the shared 2.4 GHz receiver (320F:5088) or USB cable (320F:5055): ATK V75X and the
+// VGN / VXE keyboards that VGN HUB drives the same way.
+// ATK V75X: ported from HaloBattery (github.com/HeyOkay/HaloBattery, providers/atk_keyboard.py, MIT; confirmed
+// there by its author on both), from ATK HUB 3.2.29's Evision keyboard driver (keyboard-info.util-*.js).
+// VGN / VXE: VGN HUB (drive.vgnlab.com.cn, assets/index-*.js) lists these product names on 320F:5088 / 5055,
+// FF1C:0092, report 4, type "weisheng"; its getElectricQuantity() sends [04][00 00][1A][06] and reads the
+// level from the same byte, and it checks that the reply echoes the first bytes of the request. myfinder-device-
+// battery (engine/upstream-protocols.md, "VGN 2.4G keyboard receiver") read 93% this way on a VGN receiver
+// (VGN HUB showed 94%) and saw the reply arrive about 1 s after the request, so up to 2.5 s is waited.
+//   Output report 04 on FF1C:0092, 31 payload bytes: [04][seq lo][seq hi][1A][00, or 06 for VGN][00 ...]
 //   Input report 04: [04][seq lo][seq hi][1A][..][00 00][..][percent][state: 0 on battery, 1/2 charging]
-// These ids are shared with other Evision keyboards, so the product name is checked as well.
+// These ids are shared by many Evision keyboards, so the product name is checked as well, and the keyboard is
+// named after it (the receiver's name without "2.4G Dongle").
 // The receiver is also sold under the generic name "Wireless Gaming Keyboard" (Feker Alice80 and others); the same
 // request and reply were confirmed on a Feker Alice80 on that receiver (seq echoed, command 1A, level at byte 8),
 // and its backlight still timed out while it was asked every minute. Such keyboards are shown under that name.
@@ -19,7 +26,38 @@ namespace {
 constexpr USHORT kVid = 0x320F, kReceiver = 0x5088, kCable = 0x5055;
 constexpr ULONGLONG kReceiverIntervalMs = 10 * 60 * 1000;
 
-bool ReadBattery(const HidColl& c, int& percent, bool& charging) {
+struct Model {
+    const wchar_t* product;  // product string of the receiver or the cable
+    bool vgn;                // asked the way VGN HUB asks
+};
+const Model kModels[] = {
+    { L"ATK V75X 2.4G Dongle", false },     { L"ATK V75X", false },
+    { L"VGN S99 2.4G Dongle", true },       { L"VGN S99", true },
+    { L"VGN V98pro V2 2.4G Dongle", true }, { L"VGN V98pro V2", true },
+    { L"VGN V98 PRO 2.4G Dongle", true },   { L"VGN V98pro", true },
+    { L"VGN N75 PRO 2.4G Dongle", true },   { L"VGN N75 PRO", true },
+    { L"VGN VXE75 V2 2.4G Dongle", true },  { L"VGN VXE75 V2", true },
+    { L"VGN VXE75 2.4G Dongle", true },     { L"VGN VXE75", true },
+    { L"VXE V87 2.4G Dongle", true },       { L"VXE V87", true },
+    { L"VXE V87 RGB", true },
+    { L"Wireless Gaming Keyboard", false },  // generic receiver name (Feker Alice80 and others)
+};
+
+const Model* FindModel(std::wstring& name) {
+    while (!name.empty() && name.back() == L' ') name.pop_back();
+    for (const Model& m : kModels)
+        if (_wcsicmp(name.c_str(), m.product) == 0) return &m;
+    return nullptr;
+}
+
+std::wstring KeyboardName(const std::wstring& product) {
+    const size_t n = wcslen(L" 2.4G Dongle");
+    if (product.size() > n && _wcsicmp(product.c_str() + product.size() - n, L" 2.4G Dongle") == 0)
+        return product.substr(0, product.size() - n);
+    return product;
+}
+
+bool ReadBattery(const HidColl& c, bool vgn, int& percent, bool& charging) {
     static USHORT seq = 0;
     seq = (USHORT)(seq % 0xFFFF + 1);
     HidDev d;
@@ -30,8 +68,9 @@ bool ReadBattery(const HidColl& c, int& percent, bool& charging) {
     req[1] = (BYTE)(seq & 0xFF);
     req[2] = (BYTE)(seq >> 8);
     req[3] = 0x1A;
+    req[4] = vgn ? 0x06 : 0x00;
     if (!d.Write(req)) return false;
-    ULONGLONG end = GetTickCount64() + 1000;
+    ULONGLONG end = GetTickCount64() + 2500;
     std::vector<BYTE> r;
     while ((LONGLONG)end - (LONGLONG)GetTickCount64() > 0) {
         int n = d.Read(r, 100);
@@ -54,15 +93,13 @@ void PollAtkKeyboard(PollContext& ctx) {
     for (USHORT pid : { kCable, kReceiver }) {  // the cable wins when both are connected
         if (ctx.IsClaimed(kVid, pid)) continue;
         bool cable = pid == kCable;
-        const wchar_t* product = cable ? L"ATK V75X" : L"ATK V75X 2.4G Dongle";
         for (const HidColl* c : ctx.Find(kVid, pid, [](const HidColl& c) { return c.page() == 0xFF1C && c.usage() == 0x0092; })) {
-            std::wstring name = HidProduct(*c);
-            while (!name.empty() && name.back() == L' ') name.pop_back();
-            bool generic = !cable && _wcsicmp(name.c_str(), L"Wireless Gaming Keyboard") == 0;
-            if (!generic && _wcsicmp(name.c_str(), product) != 0) continue;
+            std::wstring product = HidProduct(*c);
+            const Model* model = FindModel(product);
+            if (!model) continue;
             DeviceStatus s;
             s.key = L"atk_keyboard:5088";  // one entry for the keyboard on either connection
-            s.name = generic ? L"Wireless Gaming Keyboard" : L"ATK V75X";
+            s.name = KeyboardName(model->product);
             s.kind = DeviceKind::Keyboard;
             s.via = cable ? L"USB cable" : L"2.4 GHz receiver";
             s.graceSec = 1800;
@@ -72,7 +109,7 @@ void PollAtkKeyboard(PollContext& ctx) {
             bool charging = false;
             if (ask) {
                 lastAsk = now;
-                if (ReadBattery(*c, percent, charging)) {
+                if (ReadBattery(*c, model->vgn, percent, charging)) {
                     lastPercent = percent;
                     lastCharging = charging;
                 }

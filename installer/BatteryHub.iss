@@ -1,7 +1,7 @@
-; Inno Setup script for Wireless Battery (https://jrsoftware.org/isinfo.php).
+; Inno Setup script for BatteryHub (https://jrsoftware.org/isinfo.php).
 ; Per-user install by default: no administrator rights needed, installs to %LOCALAPPDATA%\Programs.
 ; Setup also offers "Install for all users" (Program Files, needs administrator rights).
-; Build with installer\build-installer.ps1 (or: ISCC /DAppVersion=1.2.3 installer\WirelessBattery.iss).
+; Build with installer\build-installer.ps1 (or: ISCC /DAppVersion=1.2.3 installer\BatteryHub.iss).
 
 #ifndef AppVersion
   #define AppVersion "1.0.0"
@@ -10,11 +10,11 @@
 
 [Setup]
 AppId={{7E0B5C2A-3F4D-4C8E-9B61-2D5A8F1C4E93}
-AppName=Wireless Battery
+AppName=BatteryHub
 AppVersion={#AppVersion}
-AppVerName=Wireless Battery {#AppVersion}
-AppPublisher=Wireless Battery contributors
-DefaultDirName={autopf}\Wireless Battery
+AppVerName=BatteryHub {#AppVersion}
+AppPublisher=BatteryHub contributors
+DefaultDirName={autopf}\BatteryHub
 DisableProgramGroupPage=yes
 DisableDirPage=auto
 PrivilegesRequired=lowest
@@ -23,47 +23,74 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputDir={#Root}\dist
-OutputBaseFilename=WirelessBattery-Setup-{#AppVersion}
+OutputBaseFilename=BatteryHub-Setup-{#AppVersion}
 SetupIconFile={#Root}\res\app.ico
-UninstallDisplayIcon={app}\WirelessBattery.exe
-UninstallDisplayName=Wireless Battery
+UninstallDisplayIcon={app}\BatteryHub.exe
+UninstallDisplayName=BatteryHub
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=no
 
 [Tasks]
-Name: "autostart"; Description: "Start Wireless Battery when I sign in to Windows"
+Name: "autostart"; Description: "Start BatteryHub when I sign in to Windows"
 
 [Files]
-Source: "{#Root}\WirelessBattery.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Root}\BatteryHub.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\third_party\headsetcontrol\headsetcontrol.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "{#Root}\installer\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
+[InstallDelete]
+; Before 1.1.0 the app was called Wireless Battery: remove its exe and Start menu shortcut on upgrade.
+Type: files; Name: "{app}\WirelessBattery.exe"
+Type: files; Name: "{autoprograms}\Wireless Battery.lnk"
+
 [Icons]
-Name: "{autoprograms}\Wireless Battery"; Filename: "{app}\WirelessBattery.exe"
+Name: "{autoprograms}\BatteryHub"; Filename: "{app}\BatteryHub.exe"
 
 [Run]
-Filename: "{app}\WirelessBattery.exe"; Description: "Start Wireless Battery now"; Flags: nowait postinstall skipifsilent
-Filename: "https://ko-fi.com/krisgfx"; Description: "Enjoying Wireless Battery? Support it on Ko-fi"; Flags: shellexec postinstall unchecked skipifsilent nowait runasoriginaluser
+Filename: "{app}\BatteryHub.exe"; Description: "Start BatteryHub now"; Flags: nowait postinstall skipifsilent; Check: not IsUpdate
+Filename: "https://ko-fi.com/krisgfx"; Description: "Enjoying BatteryHub? Support it on Ko-fi"; Flags: shellexec postinstall unchecked skipifsilent nowait runasoriginaluser
 
 [UninstallRun]
-Filename: "{app}\WirelessBattery.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
+Filename: "{app}\BatteryHub.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
 
 [Code]
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
 
-procedure QuitRunningApp();
+function IsUpdate(): Boolean;
+begin
+  Result := ExpandConstant('{param:WBUPDATE|0}') = '1';
+end;
+
+function QuitRunningApp(): Boolean;
 var
   Code: Integer;
 begin
-  if FileExists(ExpandConstant('{app}\WirelessBattery.exe')) then
-    Exec(ExpandConstant('{app}\WirelessBattery.exe'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Result := True;
+  if FileExists(ExpandConstant('{app}\BatteryHub.exe')) then
+    Result := Exec(ExpandConstant('{app}\BatteryHub.exe'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0)
+  else if FileExists(ExpandConstant('{app}\WirelessBattery.exe')) then  { upgrading from before the rename }
+    Result := Exec(ExpandConstant('{app}\WirelessBattery.exe'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if IsUpdate() and not QuitRunningApp() then
+    Result := 'BatteryHub could not close. Close it and try updating again.';
 end;
 
 function InstalledRunValue(): String;
+begin
+  Result := '"' + ExpandConstant('{app}\BatteryHub.exe') + '"';
+end;
+
+{ The startup entry of this copy before the rename (Wireless Battery, before 1.1.0). The value name
+  stays 'WirelessBattery' so existing entries keep working. }
+function OldRunValue(): String;
 begin
   Result := '"' + ExpandConstant('{app}\WirelessBattery.exe') + '"';
 end;
@@ -74,8 +101,18 @@ procedure RemoveOwnAutostart();
 var
   Value: String;
 begin
-  if RegQueryStringValue(HKCU, RunKey, 'WirelessBattery', Value) and (CompareText(Value, InstalledRunValue()) = 0) then
+  if RegQueryStringValue(HKCU, RunKey, 'WirelessBattery', Value) and
+     ((CompareText(Value, InstalledRunValue()) = 0) or (CompareText(Value, OldRunValue()) = 0)) then
     RegDeleteValue(HKCU, RunKey, 'WirelessBattery');
+end;
+
+{ An entry that still starts the old exe of this copy now starts BatteryHub.exe (also on silent updates). }
+procedure MigrateAutostart();
+var
+  Value: String;
+begin
+  if RegQueryStringValue(HKCU, RunKey, 'WirelessBattery', Value) and (CompareText(Value, OldRunValue()) = 0) then
+    RegWriteStringValue(HKCU, RunKey, 'WirelessBattery', InstalledRunValue());
 end;
 
 { True if this account can create the chosen folder (or write to it if it already exists).
@@ -129,9 +166,11 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssInstall then
+  if (CurStep = ssInstall) and not IsUpdate() then
     QuitRunningApp();  { upgrade: close the old version so its files can be replaced }
   if CurStep = ssPostInstall then
+    MigrateAutostart();
+  if (CurStep = ssPostInstall) and not IsUpdate() then
   begin
     { Same value the app's own "Start with Windows" menu item writes, so the two stay in sync. }
     if WizardIsTaskSelected('autostart') then

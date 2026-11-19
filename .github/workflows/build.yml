@@ -22,13 +22,26 @@ jobs:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc make
 
-      - name: Build WirelessBattery.exe
-        shell: msys2 {0}
-        run: make
+      - name: Select version and update channel
+        shell: pwsh
+        run: |
+          $version = '0.0.0'
+          $channel = 'dev'
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF_NAME.Substring(1)
+            if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'Unsupported release tag' }
+            if ($env:GITHUB_REPOSITORY -eq 'krisgfx9/Wireless-Device-Battery-Monitor') { $channel = 'stable' }
+          }
+          "WB_VERSION=$version" >> $env:GITHUB_ENV
+          "WB_CHANNEL=$channel" >> $env:GITHUB_ENV
 
-      - name: Test Rapoo protocol and driver
+      - name: Build BatteryHub.exe
         shell: msys2 {0}
-        run: make test
+        run: make VERSION="$WB_VERSION" CHANNEL="$WB_CHANNEL"
+
+      - name: Test device protocols and Windows updater
+        shell: msys2 {0}
+        run: make test VERSION="$WB_VERSION" CHANNEL="$WB_CHANNEL"
 
       - name: Install Inno Setup
         shell: pwsh
@@ -37,8 +50,7 @@ jobs:
       - name: Build installer and portable zip
         shell: pwsh
         run: |
-          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { '0.0.0' }
-          ./installer/build-installer.ps1 -Version $version
+          ./installer/build-installer.ps1 -Version $env:WB_VERSION
 
       - name: Fetch HeadsetControl source (GPL corresponding source for the bundled binary)
         shell: pwsh
@@ -48,7 +60,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: WirelessBattery
+          name: BatteryHub
           path: dist/*
 
   # Only this job can publish, and only for version tags pushed by the maintainer.
@@ -62,14 +74,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: WirelessBattery
+          name: BatteryHub
           path: dist
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           append_body: true
           body: |
-            Enjoying Wireless Battery? Support it on [Ko-fi](https://ko-fi.com/krisgfx), [PayPal](https://www.paypal.com/paypalme/krisgfx) or [GitHub Sponsors](https://github.com/sponsors/krisgfx9).
+            Enjoying BatteryHub? Support it on [Ko-fi](https://ko-fi.com/krisgfx), [PayPal](https://www.paypal.com/paypalme/krisgfx) or [GitHub Sponsors](https://github.com/sponsors/krisgfx9).
 
       # Announce the release on Discord: first what changed, then the newly supported devices.
       # The webhook lives in the DISCORD_WEBHOOK repository secret, never in the code. A failed post

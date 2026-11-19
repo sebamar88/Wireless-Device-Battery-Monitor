@@ -90,9 +90,10 @@ void PollKysona(PollContext& ctx) {
     std::vector<std::wstring> seenNames;
     for (USHORT vendor : { (USHORT)0x3554, (USHORT)0x373B, (USHORT)0x3770, (USHORT)0x33E4, (USHORT)0x3710, (USHORT)0x35BB }) {
         for (auto [vid, pid] : ctx.Products(vendor)) {
-            // ATK N9 Pro / N9 Ultra headsets speak a serial protocol (atk_serial.cpp); never send
-            // them mouse frames, even when the ATK app holds their port and they stay unclaimed.
-            if (vid == 0x373B && (pid == 0x11CA || pid == 0x11CB || pid == 0x1203 || pid == 0x1204)) continue;
+            // ATK N9 Pro / N9 Ultra headsets speak a serial protocol (atk_serial.cpp) and the ATK 8K Nano
+            // dongle 1178 a Holtek feature-report protocol (atk_bitmouse.cpp); never send them mouse frames,
+            // even when they stay unclaimed (ATK app holding the port, mouse asleep).
+            if (vid == 0x373B && (pid == 0x11CA || pid == 0x11CB || pid == 0x1203 || pid == 0x1204 || pid == 0x1178)) continue;
             // 3554:FA09 / FB40 are the "BY" keyboard receivers (AULA, MCHOSE, also used by the Redragon
             // K673) that aula.cpp handles. Their FF02:0002 collection passes the size check below, so a
             // keyboard aula.cpp could not read got two mouse frames every poll, which kept a K673 from

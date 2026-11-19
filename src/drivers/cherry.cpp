@@ -75,7 +75,9 @@ static bool Query(const HidColl& c, std::vector<BYTE>& reply) {
     return false;
 }
 
-void PollCherry(PollContext& ctx) {
+static void PollCherryXtrfy(PollContext& ctx);  // Cherry XTRFY 1K Mouse Receiver, below
+
+static void PollCherryKeyboard(PollContext& ctx) {
     for (const Model& m : kModels) {
         if (ctx.IsClaimed(kVid, m.pid)) continue;
         for (const HidColl* c : ctx.Find(kVid, m.pid, [](const HidColl& c) {
@@ -99,5 +101,104 @@ void PollCherry(PollContext& ctx) {
             ctx.Add(s, kVid, m.pid);
             return;
         }
+    }
+}
+
+void PollCherry(PollContext& ctx) {
+    PollCherryKeyboard(ctx);
+    PollCherryXtrfy(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Cherry XTRFY 1K Mouse Receiver (046A:0330) and the mouse paired to it.
+//
+// The receiver exposes a 17-byte vendor channel on usage page FF02, usage 0002 (in 17 / out 17).
+// It speaks the shared CompX framing also used by the Corsair Sabre V2 Pro (1B1C:2B2A, corsair.cpp)
+// and the Areson receivers (areson.cpp): 17-byte frames, report ID 08, checksum = 0x55 - sum of
+// the first 16 bytes. Two read-only commands are sent, nothing else:
+//   query:  [08][cmd][00 ...][checksum]
+//     03 = link status -> [6] non-zero while the mouse is connected
+//     04 = GetPower    -> [6] percent, [7] charging, [8..9] millivolts (big endian)
+//   reply:  arrives on the same collection.
+// Captured live from a Cherry XTRFY 1K Mouse Receiver with the mouse at 95% / 4084 mV:
+//   08 04 00 00 00 02 5f 00 0f f4 00 00 00 00 00 00 e5
+namespace {
+
+constexpr USHORT kXtrfyPid = 0x0330;
+constexpr size_t kXtrfyLen = 17;
+constexpr BYTE kXtrfyReportId = 0x08;
+constexpr BYTE kXtrfyLink = 0x03;
+constexpr BYTE kXtrfyPower = 0x04;
+
+std::vector<BYTE> XtrfyQuery(BYTE cmd) {
+    std::vector<BYTE> f(kXtrfyLen, 0);
+    f[0] = kXtrfyReportId;
+    f[1] = cmd;
+    unsigned sum = 0;
+    for (size_t i = 0; i + 1 < f.size(); ++i) sum += f[i];
+    f[kXtrfyLen - 1] = (BYTE)(0x55 - sum);
+    return f;
+}
+
+bool XtrfyChecksumOk(const std::vector<BYTE>& r) {
+    if (r.size() != kXtrfyLen) return false;
+    unsigned sum = 0;
+    for (size_t i = 0; i + 1 < r.size(); ++i) sum += r[i];
+    return (BYTE)(0x55 - sum) == r[kXtrfyLen - 1];
+}
+
+// One command/reply exchange on the FF02:0002 collection. Fills `r` when a well-formed reply to
+// exactly this command arrived.
+bool XtrfyExchange(HidDev& d, BYTE cmd, std::vector<BYTE>& r) {
+    d.Flush();
+    if (!d.Write(XtrfyQuery(cmd), 300)) return false;
+    const ULONGLONG end = GetTickCount64() + 500;
+    for (;;) {
+        const LONGLONG left = (LONGLONG)end - (LONGLONG)GetTickCount64();
+        if (left <= 0) return false;
+        std::vector<BYTE> frame;
+        if (d.Read(frame, (int)left) < 0) return false;
+        if (frame.size() == kXtrfyLen && frame[0] == kXtrfyReportId && frame[1] == cmd && XtrfyChecksumOk(frame)) {
+            r = std::move(frame);
+            return true;
+        }
+    }
+}
+
+}  // namespace
+
+static void PollCherryXtrfy(PollContext& ctx) {
+    if (ctx.IsClaimed(kVid, kXtrfyPid)) return;
+    for (const HidColl* c : ctx.Find(kVid, kXtrfyPid, [](const HidColl& c) {
+             return c.page() == 0xFF02 && c.usage() == 0x0002 && c.inLen() == kXtrfyLen && c.outLen() == kXtrfyLen;
+         })) {
+        HidDev d;
+        if (!d.Open(*c)) return;
+        DeviceStatus s;
+        std::vector<BYTE> r;
+        bool answered = false;
+        // Check whether the mouse is switched on and linked before asking it for power.
+        if (XtrfyExchange(d, kXtrfyLink, r)) {
+            answered = true;
+            s.connected = r[6] != 0;
+        }
+        if ((!answered || s.connected) && XtrfyExchange(d, kXtrfyPower, r)) {
+            answered = true;
+            s.connected = true;
+            if (r[6] <= 100) s.percent = r[6];
+            s.charging = r[7] != 0;
+            s.millivolts = (r[8] << 8) | r[9];
+        } else if (answered && s.connected) {
+            s.asleep = true;  // linked, but no usable power reply
+        }
+        if (!answered) return;  // silent: mouse switched off or asleep; the last value is kept
+        if (!s.connected) { ctx.Claim(kVid, kXtrfyPid); return; }
+        s.key = L"cherry:xtrfy";
+        s.name = L"Cherry XTRFY wireless mouse";
+        s.kind = DeviceKind::Mouse;
+        s.via = L"2.4 GHz receiver";
+        s.graceSec = 1800;  // existing UI keeps the last reading, dimmed, while the mouse sleeps
+        ctx.Add(s, kVid, kXtrfyPid);
+        return;
     }
 }

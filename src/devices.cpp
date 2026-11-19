@@ -47,16 +47,23 @@ std::vector<DeviceStatus> PollAllDevices() {
                         }),
                         ctx.colls.end());
     PollGlorious(ctx);
-    PollAula(ctx);       // before Kysona, which shares the 3554 vendor id and would probe it first
+    PollAula(ctx);       // before Kysona (shares the 3554 vendor id) and SONiX (shares 05AC:024F)
+    PollAulaMouse(ctx);
+    PollEweadn(ctx);     // EWEADN S7 / S9 mice on 372E:103D / 1027 (AULA keeps 372E:106C)
     PollDareu(ctx);
+    PollZenith(ctx);
     PollDarmoshark(ctx);
+    PollDarmosharkNrf(ctx);
     PollAtkSerial(ctx);  // before Kysona, which shares the ATK vendor id
     PollAtkKeyboard(ctx);
+    PollRedragonEvision(ctx);
     PollPulsar(ctx);     // before Kysona, which also scans the 3710 vendor id
     PollAtkBitmouse(ctx);  // before Kysona, which would probe the NK dongle with the wrong protocol
+    PollChimera(ctx);      // Chimera V2 mouse (3554:F512), before Kysona which shares the 3554 vendor id
     PollKysona(ctx);
     PollKeychron(ctx);
     PollCherry(ctx);
+    PollNuphy(ctx);
     PollArbiter(ctx);    // before Lamzu, which shares the 373E vendor id
     PollLamzu(ctx);
     PollEndgame(ctx);
@@ -64,11 +71,16 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollVaxee(ctx);
     PollWlmouse(ctx);
     PollFinalmouse(ctx);
+    PollScyrox(ctx);
     PollNinjutso(ctx);
     PollSprime(ctx);
+    PollRawm(ctx);
+    PollAkko(ctx);
     PollRongyuan(ctx);
     PollSonix(ctx);
+    PollViaDongle(ctx);
     PollSemico(ctx);
+    PollAjazzAk992(ctx);
     PollSonyInzone(ctx);
     PollFractal(ctx);
     PollJabra(ctx);
@@ -77,6 +89,7 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollZowie(ctx);
     PollRoyalKludge(ctx);
     PollMchose(ctx);
+    PollMchoseA5(ctx);
     PollRapoo(ctx);
     PollAreson(ctx);
     PollMchoseG3(ctx);
@@ -85,6 +98,8 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollNiceboy(ctx);    // exact 248A:FA02 match, also before the Ajazz / Delux pollers
     PollMchoseModern(ctx);
     PollMchoseHeadset(ctx);
+    PollVgn(ctx);
+    PollMchoseKeyboard(ctx);  // 3837:3033 receiver, before the generic fallbacks
     PollMiscMice(ctx);
     PollFantech(ctx);
     PollRazerHeadsets(ctx);  // before the generic Razer driver, which shares the vendor id
@@ -97,6 +112,9 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollSteelSeriesElite(ctx);
     PollSteelSeries(ctx);
     PollAudeze(ctx);
+    PollEndorfy(ctx);
+    PollTurtleBeach(ctx);
+    PollAkg(ctx);
     PollNzxt(ctx);
     PollPlantronics(ctx);
     PollCorsair(ctx);
@@ -107,12 +125,15 @@ std::vector<DeviceStatus> PollAllDevices() {
     PollGameSir(ctx);
     PollFlydigi(ctx);
     PollGameSirCyclone(ctx);
+    PollGameSirBle(ctx);  // Cyclone Pro: battery over BLE; claims its dongle before the XInput fallback
     Poll8BitDo(ctx);
     PollBeitong(ctx);  // before the XInput fallback, which only sees the receiver as wired
     PollAirPods(ctx);  // before the Bluetooth fallback, which has no level for AirPods
     PollPhoneLink(ctx);
     PollGalaxyBuds(ctx);  // before the Bluetooth fallback, which skips devices already listed by name
+    PollNothingEar(ctx);  // before the Bluetooth fallback, which skips devices already listed by name
     PollMoondrop(ctx);
+    PollDarkrim(ctx);
     PollAlienware(ctx);
     PollMaono(ctx);  // MAONO PD200W receiver (352F:040E), experimental battery query
     PollHeadsetControl(ctx);
@@ -132,5 +153,6 @@ std::wstring DumpHidCollections() {
     }
     out += report::DumpExtras();  // unopenable HID collections, non-HID USB devices, Bluetooth devices
     out += DumpXentaFrames();
+    out += DumpAstroFrames();
     return out;
 }

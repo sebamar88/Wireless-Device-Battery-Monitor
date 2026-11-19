@@ -2,8 +2,15 @@
 // 64-byte output report without report id: [01][00][81][01][0...][checksum], checksum (byte 63)
 // = 0xA1 - sum(bytes 0..62). The reply [01][..][..][01][state][rate][vid lo][vid hi][pid lo][pid hi]
 // [charging][battery %]... carries the mouse's own vendor id, which is checked so that only a
-// genuine reply is accepted. Keychron keyboards do not report their battery this way (only over
-// Bluetooth, which the Bluetooth fallback already covers).
+// genuine reply is accepted.
+//
+// Keychron keyboards on the Keychron Link receiver (3434:D030): the receiver's raw HID interface
+// (usage page FF60, usage 61, 32-byte reports, no report id) answers B2 itself with its state:
+// [B2][slots] then per slot [vid lo][vid hi][pid lo][pid hi][connected]. Stock keyboard firmware
+// never answers a battery query through the receiver; firmware with the KC_GET_BATTERY patch
+// (ldkv/qmk_firmware#1, needs WILRESS_RAW_ENABLE) answers A4 with
+// [A4][percent][mV lo][mV hi][0 = on battery / 1 = charging / 2 = full][transport][model].
+// Without that patch the query times out and nothing is reported (Bluetooth still works).
 // The 8K mice (M5 8K, G6 HE 8K ... on the TurboLink 8K receiver, Launcher protocol "8k_nordic") use
 // the same request, but on the receiver bit 6 of the first byte is set (41 00 81 01 ...). Their reply
 // [41][..][..][01][..][max rate][..]..[state][battery %][profile] has no vendor id; state 1 =
@@ -21,9 +28,68 @@
 // Sources: github.com/nvalis/nape_pro (docs/protocol-reference.md, src/nape_cli/receiver.py, checked
 // on a real D026), github.com/gtun/KeychronNapeBatteryWidget (src/nape_battery.py) and
 // github.com/ky0209/NapeBar. The same request works on the Nape Pro's own USB cable PID (3434:0440).
+// Mice on the Ultra-Link 8K receiver (3434:D028) use the Launcher's default "8k" protocol on the
+// vendor collection FFC1:0001 (the Launcher's "mouse" collection; numbered 64-byte reports). Report
+// B5 [03] asks the receiver for its slots ([03] then vid LE16, pid LE16, status x3, 1 = connected),
+// as the Launcher's getKReciverState does; report B3 [06] returns the mouse's base info, whose byte 19
+// is the power byte: bits 0-6 = battery %, bit 7 = charging (the Launcher's power.value/power.state,
+// also used for its battery-life estimate). Read-only; from launcher.keychron.com main.js.
 #include "drivers.h"
 
 namespace {
+
+// Sends a 32-byte request to the receiver's raw HID interface and waits for a reply starting with `cmd`.
+bool LinkQuery(HidDev& d, BYTE cmd, std::vector<BYTE>& r, int timeoutMs) {
+    std::vector<BYTE> req(33, 0);  // report id 0 (unnumbered) + 32 bytes
+    req[1] = cmd;
+    d.Flush();
+    if (!d.Write(req)) return false;
+    ULONGLONG end = GetTickCount64() + timeoutMs;
+    for (;;) {
+        int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+        if (left <= 0 || d.Read(r, left) < 8) return false;
+        if (r[0] == cmd) return true;
+    }
+}
+
+// Keychron keyboards with the KC_GET_BATTERY patch, either behind a Keychron Link receiver or
+// plugged in directly with the cable (then the keyboard itself owns the FF60 interface).
+void PollKeychronLinkKeyboard(PollContext& ctx, USHORT vid, USHORT pid) {
+    if (pid == 0xD026 || pid == 0x0440) return;  // Nape Pro receiver / cable: handled by PollNape
+    for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) { return c.page() == 0xFF60 && c.usage() == 0x61 && c.outLen() == 33; })) {
+        HidDev d;
+        if (!d.Open(*c)) continue;
+        std::vector<BYTE> r;
+        USHORT kbPid = 0;
+        bool viaLink = LinkQuery(d, 0xB2, r, 300);
+        if (viaLink) {
+            int slots = r[1] < 5 ? r[1] : 5;
+            for (int i = 0; i < slots && 2 + 5 * i + 4 < (int)r.size(); i++) {
+                const BYTE* s = &r[2 + 5 * i];
+                if ((s[0] | (s[1] << 8)) == 0x3434 && s[4]) { kbPid = (USHORT)(s[2] | (s[3] << 8)); break; }
+            }
+            if (!kbPid) return;  // keyboard off, asleep or on the cable: the app keeps its last value
+            // After the link has been idle, the first request is lost while it wakes up (a stray
+            // reply arrives instead); a second one is answered within ~60 ms. Worst case (stock firmware) ~1.1 s.
+            if (!LinkQuery(d, 0xA4, r, 400) && !LinkQuery(d, 0xA4, r, 400)) return;  // stock firmware
+        } else {
+            // Not a receiver (a keyboard answers B2 with VIA's "unhandled" FF): ask it directly.
+            kbPid = pid;
+            if (!LinkQuery(d, 0xA4, r, 400)) continue;  // stock firmware answers FF, never A4
+        }
+        if (r[1] > 100) return;
+        DeviceStatus s;
+        s.key = L"keychron-kb:" + Hex4(kbPid);  // same key over the receiver and the cable
+        s.name = (kbPid >= 0x0A50 && kbPid <= 0x0A58) ? L"Keychron K5 Max" : L"Keychron keyboard";
+        s.kind = DeviceKind::Keyboard;
+        s.via = viaLink ? L"2.4 GHz receiver" : L"USB cable";
+        s.percent = r[1];
+        s.millivolts = r[2] | (r[3] << 8);
+        s.charging = r[4] == 1;  // 0 on battery, 1 charging, 2 full
+        ctx.Add(s, vid, pid);
+        return;
+    }
+}
 
 void SetChecksum(std::vector<BYTE>& payload) {  // payload = 64 bytes without the report id
     unsigned sum = 0;
@@ -179,11 +245,59 @@ void PollLegacy(PollContext& ctx) {
     }
 }
 
+constexpr USHORT kUltraLink8k = 0xD028;  // Keychron Ultra-Link 8K receiver
+constexpr BYTE kUltraReceiverReport = 0xB5;
+constexpr BYTE kUltraMouseReport = 0xB3;
+
+// Sends report `id` [cmd] on the FFC1 collection and waits up to 600 ms for an input report whose
+// first payload byte (after the report id) is cmd; other reports on the channel are skipped.
+bool UltraQuery(HidDev& d, BYTE id, BYTE cmd, std::vector<BYTE>& r) {
+    d.Flush();
+    if (!d.Write({id, cmd})) return false;
+    ULONGLONG end = GetTickCount64() + 600;
+    while ((LONGLONG)end - (LONGLONG)GetTickCount64() > 0) {
+        int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+        int n = d.Read(r, left);
+        if (n < 0) return false;
+        if (n >= 21 && r[1] == cmd) return true;
+    }
+    return false;
+}
+
+// 8K mouse on the Ultra-Link 8K receiver (Launcher protocol "8k" on FFC1:0001).
+void PollUltraLink(PollContext& ctx) {
+    for (const HidColl* c : ctx.Find(0x3434, kUltraLink8k, [](const HidColl& c) { return c.page() == 0xFFC1 && c.usage() == 0x01 && c.outLen() >= 21 && c.inLen() >= 21; })) {
+        HidDev d;
+        if (!d.Open(*c)) continue;
+        std::vector<BYTE> r;
+        // Only ask when a mouse sits in a receiver slot and is connected.
+        if (!UltraQuery(d, kUltraReceiverReport, 0x03, r)) continue;
+        bool connected = false;
+        for (int off : {3, 8, 13})  // payload offsets 2/7/12 (+1 for the report id): vid LE16, pid LE16, status
+            connected = connected || ((r[off] | r[off + 1]) != 0 && r[off + 4] != 0);
+        if (!connected) continue;
+        if (!UltraQuery(d, kUltraMouseReport, 0x06, r)) continue;
+        BYTE power = r[20];  // payload byte 19
+        int percent = power & 0x7F;
+        if (percent < 1 || percent > 100) continue;
+        DeviceStatus s;
+        s.key = L"keychron:" + Hex4(kUltraLink8k);
+        s.name = CleanName(HidProduct(*c));
+        s.kind = DeviceKind::Mouse;
+        s.via = L"2.4 GHz receiver";
+        s.percent = percent;
+        s.charging = (power & 0x80) != 0;
+        ctx.Add(s, 0x3434, kUltraLink8k);
+        return;
+    }
+}
+
 }  // namespace
 
 void PollKeychron(PollContext& ctx) {
     PollNape(ctx);
     PollLegacy(ctx);
+    PollUltraLink(ctx);
     for (auto [vid, pid] : ctx.Products(0x3434)) {
         for (const HidColl* c : ctx.Find(vid, pid, [](const HidColl& c) { return c.page() >= 0xFF00 && c.outLen() == 65 && c.inLen() == 65; })) {
             HidDev d;
@@ -233,5 +347,6 @@ void PollKeychron(PollContext& ctx) {
             ctx.Add(s, vid, pid);
             break;
         }
+        PollKeychronLinkKeyboard(ctx, vid, pid);
     }
 }

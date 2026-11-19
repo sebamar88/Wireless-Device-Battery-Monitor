@@ -3,7 +3,11 @@
 //    Battery System "Absolute State Of Charge") in a feature or input report.
 //  * Bluetooth devices: Windows keeps the level it reads over HFP (classic) or the GATT Battery
 //    Service (LE) in a device property, the same value Settings > Bluetooth & devices shows.
+//    Earbuds that send Google Fast Pair battery broadcasts get their left / right / case split from
+//    those (fastpair.cpp); Windows itself only has one level for them.
 #include "drivers.h"
+#include "bluetooth_identity.h"
+#include "ble_adverts.h"
 
 #include <setupapi.h>
 #include <cfgmgr32.h>
@@ -28,6 +32,44 @@ static_assert(MergeConnectedState(true, true));
 // Enumeration order must not change the result.
 static_assert(MergeConnectedState(MergeConnectedState(false, true), false));
 static_assert(MergeConnectedState(MergeConnectedState(false, false), true));
+
+// Bluetooth address from a main device node id ("BTHENUM\DEV_6CFBED129847\..." or "BTHLE\DEV_..."), 0 if none.
+UINT64 BtAddress(const wchar_t* inst) {
+    const wchar_t* p = wcsstr(inst, L"\\DEV_");
+    if (!p) return 0;
+    p += 5;
+    UINT64 a = 0;
+    for (int i = 0; i < 12; i++) {
+        wchar_t c = p[i];
+        int v = c >= L'0' && c <= L'9' ? c - L'0' : c >= L'A' && c <= L'F' ? c - L'A' + 10 : c >= L'a' && c <= L'f' ? c - L'a' + 10 : -1;
+        if (v < 0) return 0;
+        a = a << 4 | (UINT64)v;
+    }
+    return a;
+}
+
+// Left / right / case split from a Fast Pair broadcast. Like the AirPods driver, the shown level is the
+// lower bud that is in use (discharging); charging only when every bud that reports is charging.
+void ApplyFastPair(DeviceStatus& s, const FastPairBattery& b) {
+    int disLo = -1, chgLo = -1;
+    for (auto [pct, chg] : { std::make_pair(b.left, b.leftChg), std::make_pair(b.right, b.rightChg) }) {
+        if (pct < 0) continue;
+        int& dst = chg ? chgLo : disLo;
+        if (dst < 0 || pct < dst) dst = pct;
+    }
+    if (disLo >= 0 || chgLo >= 0) {
+        s.percent = disLo >= 0 ? disLo : chgLo;
+        s.charging = disLo < 0;
+    }
+    auto part = [&](const wchar_t* label, int pct, bool chg) {
+        if (pct < 0) return;
+        if (!s.detail.empty()) s.detail += L", ";
+        s.detail += label + std::to_wstring(pct) + L"%" + (chg ? L" \x26A1" : L"");
+    };
+    part(L"L ", b.left, b.leftChg);
+    part(L"R ", b.right, b.rightChg);
+    part(L"case ", b.box, b.boxChg);
+}
 
 bool IsBatteryUsage(USHORT page, USAGE usage) {
     return (page == 0x06 && usage == 0x20) || (page == 0x85 && usage == 0x65);
@@ -96,8 +138,11 @@ DeviceKind KindFromCategory(const std::wstring& c) {
 // KindFromCollections would call them a mouse. Matched on the exact HID vid/pid seen on the LE link.
 //  * 3151:4013 Attack Shark K86 (Rongyuan firmware) over Bluetooth, from the reporter's --dump in
 //    krisgfx9/Wireless-Device-Battery-Monitor#168. Its USB ids are 3151:4011 / 4015 (OpenRGB issue 4074).
+//  * 19F5:324A NuPhy WH80 over Bluetooth, hardware-tested. Its two keyboard collections
+//    coexist with a mouse collection; USB cable mode uses 19F5:A011 instead.
 DeviceKind KindFromBleIds(USHORT vid, USHORT pid) {
     if (vid == 0x3151 && pid == 0x4013) return DeviceKind::Keyboard;
+    if (vid == 0x19F5 && pid == 0x324A) return DeviceKind::Keyboard;
     return DeviceKind::Other;
 }
 
@@ -204,6 +249,7 @@ void PollBluetooth(PollContext& ctx) {
     std::map<std::wstring, UINT32> containerCod;         // container id -> class of device
     std::map<std::wstring, std::wstring> containerCat;   // container id -> device container category
     std::map<std::wstring, bool> containerConn;          // container id -> main BT device node connected
+    std::map<std::wstring, UINT64> containerAddr;        // container id -> Bluetooth address
     std::map<std::wstring, Found> battery;
     SP_DEVINFO_DATA dd{ sizeof(dd) };
     for (DWORD i = 0; SetupDiEnumDeviceInfo(di, i, &dd); i++) {
@@ -223,6 +269,7 @@ void PollBluetooth(PollContext& ctx) {
         if (name.empty()) name = StrProp(di, &dd, DEVPKEY_Device_DeviceDesc);
         if (!wcsncmp(inst, L"BTHENUM\\DEV_", 12) || !wcsncmp(inst, L"BTHLE\\DEV_", 10)) {
             containerName[cid] = name;
+            if (UINT64 addr = BtAddress(inst)) containerAddr[cid] = addr;
             UINT32 cod = 0;
             if (SetupDiGetDevicePropertyW(di, &dd, &kClassOfDevice, &t, (PBYTE)&cod, sizeof(cod), nullptr, 0) && t == DEVPROP_TYPE_UINT32)
                 containerCod[cid] = cod;
@@ -266,6 +313,7 @@ void PollBluetooth(PollContext& ctx) {
         if (ctx.IsClaimed(c.vid, c.pid)) reported.insert(cont);
     }
 
+    bool watching = false, waited = false;
     for (auto& [cid, f] : battery) {
         if (reported.count(cid)) continue;
         auto mc = containerConn.find(cid);
@@ -275,10 +323,10 @@ void PollBluetooth(PollContext& ctx) {
         auto it = containerName.find(cid);
         s.name = (it != containerName.end() && !it->second.empty()) ? it->second : f.name;
         if (s.name.empty()) s.name = L"Bluetooth device";
-        // Skip devices a vendor driver already reported over HID++ / Bragi on the same link.
-        bool dup = false;
-        for (auto& o : ctx.out) dup |= o.name == s.name;
-        if (dup) continue;
+        // Bluetooth entries use the Windows container ID (s.key), never the display name.
+        // Two Xbox controllers may both be named "Xbox Wireless Controller".
+        // Preserve the name fallback for devices already reported by non-Bluetooth drivers.
+        if (IsDuplicateBluetoothDevice(s, ctx.out)) continue;
         s.via = L"Bluetooth";
         s.percent = f.pct;
         auto cod = containerCod.find(cid);
@@ -293,6 +341,24 @@ void PollBluetooth(PollContext& ctx) {
         if (s.kind == DeviceKind::Other && ids != hidIds.end()) s.kind = KindFromBleIds(ids->second.first, ids->second.second);
         if (s.kind == DeviceKind::Other && ids != hidIds.end()) s.kind = KindFromCollections(ctx.colls, ids->second.first, ids->second.second);
         if (s.kind == DeviceKind::Other) s.kind = GuessKind(s.name);
+        auto addr = containerAddr.find(cid);
+        if (s.kind == DeviceKind::Headset && addr != containerAddr.end()) {
+            // The passive BLE watcher starts with the first Bluetooth headset and keeps running. Right
+            // after it starts, wait once (up to 3 s) for broadcasts, which come about every 1-2 s.
+            bool justStarted = false;
+            if (!watching) {
+                watching = true;
+                justStarted = EnsureBleWatcher();
+            }
+            FastPairBattery b;
+            bool got = FastPairLookup(addr->second, b);
+            for (int i = 0; !got && justStarted && !waited && i < 15; i++) {
+                Sleep(200);
+                got = FastPairLookup(addr->second, b);
+            }
+            waited |= justStarted;
+            if (got) ApplyFastPair(s, b);
+        }
         ctx.out.push_back(s);
         ctx.btContainers.insert(cid);
     }

@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 
 namespace {
 void Check(bool condition, const char* expression, int line) {
@@ -13,9 +14,13 @@ void Check(bool condition, const char* expression, int line) {
 }
 #define CHECK(condition) Check((condition), #condition, __LINE__)
 
-BYTE replyValue = 0, expectedCommand = 0xD2;
-int replySize = 2;
+// Simulated interface 3: every write queues `noise` (traffic from another app such as GG, when set),
+// and the write numbered `replyOnWrite` also queues `reply`. Reads return the queued reports in order.
+BYTE expectedCommand = 0xD2;
 bool writeOk = true;
+int writes = 0, replyOnWrite = 1;
+std::vector<BYTE> reply, noise;
+std::deque<std::vector<BYTE>> queued;
 
 HidColl Collection(USHORT pid) {
     HidColl c;
@@ -28,26 +33,64 @@ HidColl Collection(USHORT pid) {
     return c;
 }
 
-PollContext Poll(USHORT pid) {
+PollContext Poll(USHORT pid, BYTE command, std::vector<BYTE> payload) {
+    expectedCommand = command;
+    writes = 0;
+    reply = payload;
+    if (!reply.empty()) reply.insert(reply.begin(), command);
     PollContext ctx;
     ctx.colls = { Collection(pid) };
     PollSteelSeries(ctx);
     return ctx;
 }
+
+struct Model { USHORT pid; bool wired; const wchar_t* name; };
+struct Sample { std::vector<BYTE> payload; int percent; bool charging, connected; };
+
+void Expect(const Model& model, const Sample& sample) {
+    BYTE command = model.wired ? 0x92 : 0xD2;
+    auto ctx = Poll(model.pid, command, sample.payload);
+    CHECK(ctx.out.size() == 1 && ctx.IsClaimed(0x1038, model.pid));
+    const auto& s = ctx.out.front();
+    if (s.percent != sample.percent || s.charging != sample.charging || s.connected != sample.connected) {
+        std::fprintf(stderr, "PID %04X reply %02X %02X: got percent=%d charging=%d connected=%d; expected %d %d %d\n",
+                     model.pid, sample.payload[0], sample.payload.size() > 1 ? sample.payload[1] : 0, s.percent,
+                     s.charging, s.connected, sample.percent, sample.charging, sample.connected);
+        std::exit(EXIT_FAILURE);
+    }
+    CHECK(s.name == model.name);
+    CHECK(s.graceSec == 1800);  // the last level stays, dimmed, while the mouse is off or asleep
+    CHECK(s.key == L"steelseries:" + Hex4(model.pid));
+    CHECK(s.kind == DeviceKind::Mouse);
+    CHECK(s.via == (model.wired ? L"USB cable" : L"2.4 GHz receiver"));
+}
+
+void ExpectNothing(USHORT pid, BYTE command, std::vector<BYTE> payload) {
+    auto ctx = Poll(pid, command, payload);
+    CHECK(ctx.out.empty() && ctx.claimed.empty());
+}
 }  // namespace
 
 bool HidDev::Open(const HidColl& c) { c_ = c; h_ = reinterpret_cast<HANDLE>(1); return true; }
 void HidDev::Close() { h_ = INVALID_HANDLE_VALUE; }
-void HidDev::Flush() {}
+void HidDev::Flush() { queued.clear(); }
 bool HidDev::Write(const std::vector<BYTE>& data, int) {
     CHECK(data == std::vector<BYTE>({ 0x00, expectedCommand }));
-    return writeOk;
+    if (!writeOk) return false;
+    ++writes;
+    if (!noise.empty()) queued.push_back(noise);
+    if (writes == replyOnWrite && !reply.empty()) queued.push_back(reply);
+    return true;
 }
 int HidDev::Read(std::vector<BYTE>& out, int timeoutMs) {
-    CHECK(timeoutMs > 0 && timeoutMs <= 300);
-    out = { expectedCommand, replyValue };
-    out.resize(replySize);
-    return replySize ? replySize : -1;
+    CHECK(timeoutMs > 0 && timeoutMs <= 100);
+    if (queued.empty()) {  // like a real read, nothing arrives before the timeout
+        Sleep(timeoutMs);
+        return -1;
+    }
+    out = queued.front();
+    queued.pop_front();
+    return (int)out.size();
 }
 std::wstring Hex4(USHORT v) {
     wchar_t text[8];
@@ -58,45 +101,82 @@ int Clamp100(int v) { return v < 0 ? 0 : v > 100 ? 100 : v; }
 int MapTo100(int v, int lo, int hi) { return Clamp100((v - lo) * 100 / (hi - lo)); }
 
 int main() {
-    struct Model { USHORT pid; bool wired; };
-    const Model models[] = { { 0x1838, false }, { 0x183A, true }, { 0x1852, false }, { 0x1854, true },
-                             { 0x1858, false }, { 0x185A, true }, { 0x1840, false }, { 0x1842, true } };
-    struct Sample { BYTE reply; int percent; bool charging, connected; };
-    const Sample samples[] = {
-        { 0x01, 0, false, true }, { 0x13, 90, false, true }, { 0x15, 100, false, true },
-        { 0x81, 0, true, true }, { 0x93, 90, true, true }, { 0x95, 100, true, true },
-        // Out-of-range levels must stay unknown and never invent a charging state.
-        { 0xFF, -1, false, true }, { 0x7F, -1, false, true },
-        { 0x16, -1, false, true }, { 0x96, -1, false, true },
-        // Zero is the existing off / out-of-range indication, even with the charging bit set.
-        { 0x00, -1, false, false }, { 0x80, -1, false, false },
+    // Step layout: [1] = (level/5 + 1) | charging<<7.
+    const Model stepModels[] = {
+        { 0x1838, false, L"SteelSeries Aerox 3 Wireless" },
+        { 0x183A, true, L"SteelSeries Aerox 3 Wireless" },
+        { 0x1878, false, L"SteelSeries Aerox 3 Wireless CS2 Dragon Lore Edition" },
+        { 0x187A, true, L"SteelSeries Aerox 3 Wireless CS2 Dragon Lore Edition" },
+        { 0x1852, false, L"SteelSeries Aerox 5 Wireless" },
+        { 0x1854, true, L"SteelSeries Aerox 5 Wireless" },
+        { 0x1858, false, L"SteelSeries Aerox 9 Wireless" },
+        { 0x185A, true, L"SteelSeries Aerox 9 Wireless" },
+        { 0x1840, false, L"SteelSeries Prime Wireless" },
+        { 0x1842, true, L"SteelSeries Prime Wireless" },
     };
-    for (const auto& model : models) {
-        expectedCommand = model.wired ? 0x92 : 0xD2;
-        for (const auto& sample : samples) {
-            replyValue = sample.reply;
-            auto ctx = Poll(model.pid);
-            CHECK(ctx.out.size() == 1 && ctx.IsClaimed(0x1038, model.pid));
-            const auto& status = ctx.out.front();
-            if (status.percent != sample.percent || status.charging != sample.charging || status.connected != sample.connected) {
-                std::fprintf(stderr, "PID %04X reply %02X: got percent=%d charging=%d connected=%d; expected %d %d %d\n",
-                             model.pid, sample.reply, status.percent, status.charging, status.connected,
-                             sample.percent, sample.charging, sample.connected);
-                return EXIT_FAILURE;
-            }
-            CHECK(status.kind == DeviceKind::Mouse);
-            CHECK(status.via == (model.wired ? L"USB cable" : L"2.4 GHz receiver"));
-        }
+    const Sample stepSamples[] = {
+        { { 0x01 }, 0, false, true }, { { 0x13 }, 90, false, true }, { { 0x15 }, 100, false, true },
+        { { 0x81 }, 0, true, true }, { { 0x93 }, 90, true, true }, { { 0x95 }, 100, true, true },
+        // Captured on a Dragon Lore Edition: receiver on battery, then cable while charging.
+        { { 0x0A, 0x00, 0x34, 0x2E, 0x31 }, 45, false, true },
+        { { 0x8B, 0x00, 0x34, 0x2E, 0x31 }, 50, true, true }, { { 0x8C, 0x00 }, 55, true, true },
+        // Out-of-range levels must stay unknown and never invent a charging state.
+        { { 0xFF }, -1, false, true }, { { 0x7F }, -1, false, true },
+        { { 0x16 }, -1, false, true }, { { 0x96 }, -1, false, true },
+    };
+    for (const auto& model : stepModels) {
+        for (const auto& sample : stepSamples) Expect(model, sample);
+        // Zero means off or asleep, even with the charging bit set: left out so the tray keeps the last level.
+        ExpectNothing(model.pid, model.wired ? 0x92 : 0xD2, { 0x00 });
+        ExpectNothing(model.pid, model.wired ? 0x92 : 0xD2, { 0x80 });
     }
 
-    expectedCommand = 0xD2;
-    writeOk = false;
-    CHECK(Poll(0x1838).out.empty());
-    writeOk = true;
-    for (int size : { 0, 1 }) {
-        replySize = size;
-        auto ctx = Poll(0x1838);
-        CHECK(ctx.out.empty() && ctx.claimed.empty());
+    // Percent layout (Aerox 3 Wireless Gen 2): [1] 00 battery / 01 charging / 02 charged, [2] level.
+    const Model gen2[] = { { 0x1890, false, L"SteelSeries Aerox 3 Wireless Gen 2" },
+                           { 0x1892, true, L"SteelSeries Aerox 3 Wireless Gen 2" } };
+    for (const auto& model : gen2) {
+        // Captured on hardware in rivalcfg issue #276.
+        Expect(model, { { 0x00, 0x61, 0x00 }, 97, false, true });
+        Expect(model, { { 0x01, 0x56, 0x00 }, 86, true, true });
+        Expect(model, { { 0x02, 0x64, 0x00 }, 100, true, true });
+        Expect(model, { { 0x00, 0xFF, 0x00 }, -1, false, true });  // not measured yet
+        Expect(model, { { 0x01, 0xFF, 0x00 }, -1, true, true });
+        Expect(model, { { 0x01, 0x00, 0x00 }, 0, true, true });
+        Expect(model, { { 0x00, 0x65, 0x00 }, -1, false, true });  // above 100: unknown
+        // 00 00 through the receiver means the mouse is off (left out); on the cable it is a real 0%.
+        BYTE command = model.wired ? 0x92 : 0xD2;
+        if (model.wired) Expect(model, { { 0x00, 0x00, 0x00 }, 0, false, true });
+        else ExpectNothing(model.pid, command, { 0x00, 0x00, 0x00 });
+        ExpectNothing(model.pid, command, { 0x12, 0x00, 0x00 });  // a step-layout reply is not a Gen 2 status
+        ExpectNothing(model.pid, command, { 0x01 });              // too short for the level byte
     }
-    std::puts("SteelSeries mouse tests passed (eight models, USB/wireless, battery bounds, charging, offline, I/O failures).");
+
+    // Reports that do not echo the command are skipped (an acknowledgement, then the reply).
+    noise = { 0x11, 0x00 };
+    Expect(stepModels[2], { { 0x0A }, 45, false, true });
+    // GG talking over the query: its reports keep coming and the receiver answers the third write.
+    noise = { 0x61, 0x00, 0x00, 0x34, 0x2E, 0x31 };
+    replyOnWrite = 3;
+    Expect(stepModels[2], { { 0x0A }, 45, false, true });
+    CHECK(writes == 3);
+    Expect(gen2[0], { { 0x00, 0x61, 0x00 }, 97, false, true });
+    // No echo before the deadline: nothing is reported or claimed, and the query was resent.
+    ExpectNothing(0x1878, 0xD2, {});
+    CHECK(writes >= 5 && writes <= 11);
+    replyOnWrite = 1;
+    // Mouse switched off: the Dragon Lore receiver answers 40 FF, which ends the wait at once.
+    noise = { 0x40, 0xFF, 0x31, 0x34, 0x2E, 0x31 };
+    ULONGLONG started = GetTickCount64();
+    ExpectNothing(0x1878, 0xD2, {});
+    CHECK(writes == 1 && GetTickCount64() - started < 100);
+    noise.clear();
+
+    // I/O failures.
+    writeOk = false;
+    ExpectNothing(0x1838, 0xD2, { 0x13 });
+    CHECK(writes == 0);
+    writeOk = true;
+    ExpectNothing(0x1838, 0xD2, {});  // receiver never answers
+    std::puts("SteelSeries mouse tests passed (step and Gen 2 layouts, 12 models, USB/wireless, battery bounds, "
+              "charging, off/asleep left out, echo filtering, resend, receiver NACK, I/O failures).");
 }

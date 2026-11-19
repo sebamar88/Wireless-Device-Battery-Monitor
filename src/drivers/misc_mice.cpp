@@ -118,6 +118,11 @@ void PollMotospeed(PollContext& ctx) {
 // every link-up starts with a false 100% (github.com/qu1ncky/BatteryTray, XentaReceiverProvider).
 struct XentaModel { BYTE code; const wchar_t* name; bool tens; };
 const XentaModel kXentaModels[] = {
+    // Official Inphic HUB model table: https://hub.inphic.cn/assets/index-BcHQx9B6.js
+    // A device sold as IN10 MAX reported 0x73 (IN10RMax in HUB), 03 73 41 01 64,
+    // on 1D57:FA65 / "Inphic KP 8K". Keep the firmware model names distinct.
+    { 0x73, L"Inphic IN10R MAX", false },
+    { 0x74, L"Inphic IN10 MAX", false },  // official table; not hardware-tested
     { 0x3D, L"Delux M900 Pro", false },
     { 0x30, L"Delux M900 Pro", false },
     { 0x50, L"Delux M900 Pro", false },

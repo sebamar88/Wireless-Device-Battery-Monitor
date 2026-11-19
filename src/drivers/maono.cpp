@@ -4,7 +4,8 @@
 // VID:PID 352F:040E, interface 3, usage page/usage 000C:0001,
 // input/output reports 64 bytes, no feature reports.
 // Battery register 0x0042 tracks the vendor software's battery level
-// as the battery discharges. No device is reported when the mic is off.
+// as the battery discharges. If the mic stops answering, the receiver must
+// stay claimed so the generic HID fallback cannot report a spurious 0%.
 //
 // PD200W transport reference (documented for a different PID, 352F:0411):
 // https://github.com/iamsh4/maomao/blob/main/protocol-pd200w.md
@@ -25,7 +26,7 @@ namespace
     constexpr BYTE kReportId = 0xC4;
     constexpr BYTE kGet = 0x04;
 
-    // Candidate inherited from PD100W. Unconfirmed on PD200W.
+    // Inherited from PD100W; battery readings tested on PD200W 352F:040E.
     constexpr USHORT kBatteryRegister = 0x0042;
 
     constexpr int kInterface = 3;
@@ -159,6 +160,14 @@ void PollMaono(PollContext &ctx)
                                                c.outLen() == kReportLength &&
                                                c.featLen() == 0; });
 
+    if (collections.empty())
+        return;
+
+    // The USB receiver remains enumerated when the microphone is off. Reserve
+    // this exact device even if opening it or reading its battery fails: otherwise
+    // PollGenericHid may report the receiver's battery field as a connected 0%.
+    ctx.Claim(kVid, kPid);
+
     for (const HidColl *collection : collections)
     {
         HidDev device;
@@ -170,12 +179,11 @@ void PollMaono(PollContext &ctx)
             continue;
 
         DeviceStatus status;
-        status.key = L"maono:pd200w:" + collection->path;
+        status.key = ctx.StableKey(L"maono:pd200w");
         status.name = L"MAONO PD200W";
-        status.kind = DeviceKind::Other;
+        status.kind = DeviceKind::Microphone;
         status.via = L"2.4 GHz receiver";
         status.percent = percent;
-        // status.detail = L"experimental battery register 0x0042";
 
         // Charging and link-state registers are not established.
         // Do not infer either state from the battery percentage.

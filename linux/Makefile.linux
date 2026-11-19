@@ -42,6 +42,8 @@ test:
 	@mkdir -p build/linux
 	$(CXX) $(CXXFLAGS) tests/linux_hid_test.cpp -o build/linux/linux_hid_test
 	./build/linux/linux_hid_test
+	$(CXX) $(CXXFLAGS) tests/json_output_test.cpp -o build/linux/json_output_test
+	./build/linux/json_output_test
 
 clean:
 	rm -rf build/linux $(TARGET)

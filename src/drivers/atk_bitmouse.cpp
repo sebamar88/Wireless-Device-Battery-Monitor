@@ -8,12 +8,22 @@
 //   No reply = the mouse is asleep or switched off (moving it brings the reading back).
 // From github.com/HeyOkay/HaloBattery PR #350 (providers/atk_bitmouse.py; verified by a VXE R1 owner on
 // Windows: the level matches ATK's app, charging follows the cable) and github.com/qwr79/mouse-battery.
+//
+// ATK "8K Nano Dongle" 373B:1178 (NK mouse 8K NANO dongle) is a Holtek receiver with a different protocol on
+// vendor collection FF10:0001 (65-byte input/output, 9-byte feature report, no report ids):
+//   Feature report 00, 8 bytes: [82][00 x7] (GetConfigData).
+//   Reply as an input report: [82][rate][dpi stage][light mode][brightness][speed][color][reserved]
+//   [battery][link]...; battery bit 7 = charging, bits 0..6 = percent; link 0 = no mouse paired/awake.
+// From ATK HUB (v3-hub.atkgear.com 3.2.33, static/AtkRadioGroup-*.js): the Holtek mouse controller lists
+// productId 4472 (0x1178), usagePage 0xFF10 usage 1, "ATK 8K Nano Dongle", and reads battery and link state
+// with GetConfigData (0x82) sent as feature report 0, the reply matched on its first byte.
 #include "drivers.h"
 
 namespace {
 
 const USHORT kVid = 0x373B;
 const USHORT kNanoDongle = 0x1216;
+const USHORT kNano8kDongle = 0x1178;
 
 // Sends command `cmd` and returns its one-byte payload, or -1 when there is no valid reply.
 int Query(HidDev& d, BYTE cmd) {
@@ -42,9 +52,56 @@ int Query(HidDev& d, BYTE cmd) {
     }
 }
 
+// 8K Nano dongle: GetConfigData (0x82) as feature report 0; the reply arrives as an input report
+// starting with 0x82. Returns false when nothing valid came back.
+bool QueryNano8kConfig(HidDev& d, std::vector<BYTE>& r) {
+    d.Flush();
+    if (!d.SetFeature({0x00, 0x82})) return false;
+    ULONGLONG end = GetTickCount64() + 700;
+    for (;;) {
+        int left = (int)((LONGLONG)end - (LONGLONG)GetTickCount64());
+        if (left <= 0) return false;
+        if (d.Read(r, left) < 10) return false;
+        if (r[0] == 0x82) return true;  // other input reports (e.g. 0x12 DPI / rate notifications) are skipped
+    }
+}
+
+void PollNano8k(PollContext& ctx) {
+    if (ctx.IsClaimed(kVid, kNano8kDongle)) return;
+    for (const HidColl* c : ctx.Find(kVid, kNano8kDongle, [](const HidColl& c) {
+             return c.page() == 0xFF10 && c.usage() == 0x0001 && c.featLen() >= 9 && c.inLen() >= 11;
+         })) {
+        HidDev d;
+        if (!d.Open(*c)) continue;
+        std::vector<BYTE> r;
+        if (!QueryNano8kConfig(d, r)) continue;
+        // The dongle speaks this protocol: keep the Kysona driver from probing it with its 17-byte frames.
+        if (r[9] == 0) {
+            ctx.Claim(kVid, kNano8kDongle);  // no mouse linked (off or asleep)
+            return;
+        }
+        int level = r[8] & 0x7F;
+        if (level < 1 || level > 100) {
+            ctx.Claim(kVid, kNano8kDongle);
+            return;
+        }
+        DeviceStatus s;
+        s.key = L"atknano8k:" + Hex4(kNano8kDongle);
+        s.name = L"ATK 8K Nano mouse";  // the dongle is shared by several ATK / VXE models
+        s.kind = DeviceKind::Mouse;
+        s.via = L"2.4 GHz receiver";
+        s.graceSec = 1800;
+        s.percent = level;
+        s.charging = (r[8] & 0x80) != 0;
+        ctx.Add(s, kVid, kNano8kDongle);
+        return;
+    }
+}
+
 }  // namespace
 
 void PollAtkBitmouse(PollContext& ctx) {
+    PollNano8k(ctx);
     if (ctx.IsClaimed(kVid, kNanoDongle)) return;
     for (const HidColl* c : ctx.Find(kVid, kNanoDongle, [](const HidColl& c) {
              return c.page() == 0xFF05 && c.usage() == 0x0001 && c.outLen() >= 64 && c.inLen() >= 8;

@@ -73,7 +73,7 @@ whole percentage at the same reply offset. Applying this driver's ×10 scale the
 ## Validation
 
 The full application was built with MSVC C++17 and the Windows SDK and run against the actual
-mouse. `WirelessBattery.exe --list` returned:
+mouse. `BatteryHub.exe --list` returned:
 
 ```text
 Redragon wireless mouse  [2.4 GHz receiver]  80%   (areson:25A7:FA07)

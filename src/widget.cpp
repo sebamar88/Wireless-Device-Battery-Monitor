@@ -57,7 +57,7 @@ int Px(int v) { return MulDiv(v, Dpi(), 96); }
 // UI Automation calls go to Explorer and wait for its UI thread, while our widget is a child window
 // of the taskbar, so Explorer in turn waits for our UI thread whenever it lays out or sends input to
 // the widget. Making those calls from our UI thread deadlocks both: Explorer is reported hung
-// ("Cross-process", waiting on WirelessBattery.exe) and restarted, again and again. So the lookup
+// ("Cross-process", waiting on BatteryHub.exe) and restarted, again and again. So the lookup
 // runs on its own thread, which owns no windows, and the UI thread only reads the last rectangle.
 SRWLOCK g_wbLock = SRWLOCK_INIT;
 RECT g_wbRect{};             // last Widgets button rectangle (screen), empty when unknown
@@ -65,14 +65,17 @@ HWND g_wbRectBar;            // taskbar g_wbRect was found in (guarded by g_wbLo
 HWND g_wbTaskbar;            // taskbar to search, null while there is no widget (guarded by g_wbLock)
 HANDLE g_wbWake;             // auto-reset: wakes the lookup thread early
 
-// Where a Windows 11 secondary taskbar's clock and task buttons are. Its XAML has no child windows for
-// them, so the same lookup thread reads them with UI Automation (the clock has AutomationId
-// "SystemTrayIcon", task buttons class "Taskbar.TaskListButtonAutomationPeer"; found by PR #107).
+// Where a Windows 11 secondary taskbar's clock, widgets button and task buttons are. Its XAML has no child
+// windows for them, so the same lookup thread reads them with UI Automation (the clock has AutomationId
+// "SystemTrayIcon", widgets button "WidgetsButton", task buttons class "Taskbar.TaskListButtonAutomationPeer";
+// found by PR #107).
 struct Span {
     HWND bar = nullptr;
     bool measured = false;   // UI Automation answered for this taskbar
     bool hasClock = false;   // the clock can be turned off on secondary taskbars
     int clockLeft = 0;       // screen x
+    bool hasWidgets = false; // Widgets (weather) button on secondary taskbar
+    RECT widgets{};          // bounding rectangle of WidgetsButton (screen coords)
     bool hasTasks = false;
     int tasksRight = 0;      // right edge of the last task button left of the clock (screen x)
 };
@@ -115,6 +118,17 @@ Span MeasureSpan(IUIAutomation* uia, HWND bar) {
         if (all) all->Release();
         clock->Release();
     }
+    if (IUIAutomationCondition* wbCond = StringCondition(uia, UIA_AutomationIdPropertyId, L"WidgetsButton")) {
+        IUIAutomationElement* wbEl = nullptr;
+        RECT r{};
+        if (SUCCEEDED(root->FindFirst(TreeScope_Descendants, wbCond, &wbEl)) && wbEl &&
+            SUCCEEDED(wbEl->get_CurrentBoundingRectangle(&r)) && inBar(r)) {
+            s.widgets = r;
+            s.hasWidgets = true;
+        }
+        if (wbEl) wbEl->Release();
+        wbCond->Release();
+    }
     if (IUIAutomationCondition* task = StringCondition(uia, UIA_ClassNamePropertyId, L"Taskbar.TaskListButtonAutomationPeer")) {
         IUIAutomationElementArray* all = nullptr;
         int n = 0;
@@ -123,7 +137,8 @@ Span MeasureSpan(IUIAutomation* uia, HWND bar) {
                 IUIAutomationElement* el = nullptr;
                 RECT r{};
                 if (SUCCEEDED(all->GetElement(i, &el)) && el && SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && inBar(r) &&
-                    (!s.hasClock || r.right <= s.clockLeft) && (!s.hasTasks || r.right > s.tasksRight)) {
+                    (!s.hasClock || r.right <= s.clockLeft) && (!s.hasWidgets || r.right <= s.widgets.left) &&
+                    (!s.hasTasks || r.right > s.tasksRight)) {
                     s.tasksRight = r.right;
                     s.hasTasks = true;
                 }
@@ -235,10 +250,12 @@ wchar_t Glyph(DeviceKind k, bool bluetooth) {
         case DeviceKind::Keyboard: return 0xE765;  // KeyboardClassic
         case DeviceKind::Gamepad:  return 0xE7FC;  // Game
         case DeviceKind::Phone:    return 0xE8EA;  // CellPhone
+        case DeviceKind::Microphone: return 0xE720;  // Microphone
         default:                   return bluetooth ? 0xE702 : 0xE772;  // Bluetooth / Devices
     }
 }
 constexpr wchar_t kBolt = 0xE945;            // LightningBolt
+constexpr wchar_t kCheck = 0xE73E;           // CheckMark, in place of the bolt once fully charged
 constexpr wchar_t kBatteryUnknown = 0xE996;  // shown when there is nothing to display
 
 // Creates a font, falling back when the preferred face is not installed (GDI would silently substitute).
@@ -384,6 +401,7 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
     Rgb fg = g_light ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 };
     Rgb red = g_light ? Rgb{ 196, 30, 40 } : Rgb{ 255, 90, 90 };
     Rgb charge = g_light ? Rgb{ 0, 120, 212 } : Rgb{ 96, 205, 255 };
+    Rgb full = g_light ? Rgb{ 16, 124, 16 } : Rgb{ 108, 203, 95 };  // Windows "success" green
     HFONT icons = MakeFont(Px(16), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
     HFONT bolt = MakeFont(Px(11), FW_NORMAL, L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
     HFONT text = MakeFont(Px(13), FW_NORMAL, L"Segoe UI Variable Text", L"Segoe UI", Px(12));
@@ -397,8 +415,9 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
         const auto& it = g_items[i];
         int a = it.dim ? 120 : 255;
         Rgb tc = it.low ? red : fg;
+        bool mark = it.charging || it.full;  // bolt while charging, green check mark once full
         size_t glyph = out.size();
-        slots.push_back({ (int)glyph, (int)glyph + 1, it.charging ? (int)glyph + 2 : -1 });
+        slots.push_back({ (int)glyph, (int)glyph + 1, mark ? (int)glyph + 2 : -1 });
         bool branded = it.accent != Accent::None;
         BrandColor bc = AccentColor(it.accent, g_light);
         Rgb accent{ bc.r, bc.g, bc.b };
@@ -410,13 +429,13 @@ std::vector<Piece> Layout(int barW, int barH, int& width, int& height) {
         }
         out.push_back(std::move(icon));
         std::wstring t = !it.text.empty() ? it.text : it.percent >= 0 ? std::to_wstring(it.percent) + L"%" : L"?";
-        Piece label{ RenderMask(t, text, g_light), tc, a, it.charging ? Px(2) : 0 };
+        Piece label{ RenderMask(t, text, g_light), tc, a, mark ? Px(2) : 0 };
         if (branded && it.percent >= 0) {
             label.barPct = it.percent;
             label.barColor = it.low ? red : accent;
         }
         out.push_back(std::move(label));
-        if (it.charging) out.push_back({ RenderMask(std::wstring(1, kBolt), bolt, g_light), charge, a, 0 });
+        if (mark) out.push_back({ RenderMask(std::wstring(1, it.full ? kCheck : kBolt), bolt, g_light), it.full ? full : charge, a, 0 });
         out.back().gapAfter = i + 1 < g_items.size() ? Px(14) : 0;
         if (!it.label.empty()) {  // tiny caption in the bottom-right corner of the icon
             Piece c{ RenderMask(it.label, caption, g_light), fg, a, 0 };
@@ -585,8 +604,8 @@ void HideMirror(Mirror& m) {
     m.lastLeft = INT_MIN;
 }
 
-// Places a mirror left of its taskbar's clock, or hides it when that spot is unknown or taken by task
-// buttons: never guess and cover something.
+// Places a mirror left of its taskbar's clock (and left of the Widgets button if present), or hides it
+// when that spot is unknown or taken by task buttons: never guess and cover something.
 void PositionMirror(Mirror& m) {
     RECT bar{};
     if (!GetWindowRect(m.bar, &bar) || (GetWindowLongW(m.bar, GWL_EXSTYLE) & WS_EX_LAYOUTRTL)) { HideMirror(m); return; }
@@ -594,16 +613,33 @@ void PositionMirror(Mirror& m) {
     if (Dpi() != m.dpi || m.size.cy != bar.bottom - bar.top) PaintMirror(m), g_dpiBar = m.bar;
     int right = 0, minLeft = bar.left;
     bool known = false;
-    if (!IsXamlTaskbar(m.bar)) {  // Windows 10: the clock is a real child window (absent when it is turned off)
+    // StartAllBack can put a full notification area on each secondary taskbar.
+    // Use its left edge, as on the primary taskbar, to clear all of the tray icons.
+    HWND tray = FindWindowExW(m.bar, nullptr, L"TrayNotifyWnd", nullptr);
+    RECT tr{};
+    if (tray && IsWindowVisible(tray) && GetWindowRect(tray, &tr) &&
+        tr.left > bar.left && tr.right <= bar.right && tr.right > tr.left &&
+        tr.bottom > bar.top && tr.top < bar.bottom) {
+        right = tr.left;
+        known = true;
+    } else if (!IsXamlTaskbar(m.bar)) {  // Windows 10: the clock is a real child window (absent when it is turned off)
         HWND clock = FindWindowExW(m.bar, nullptr, L"ClockButton", nullptr);
         RECT cr{};
         right = clock && IsWindowVisible(clock) && GetWindowRect(clock, &cr) ? cr.left : bar.right - Px(8);
+        for (const wchar_t* cls : { L"ShellFeedsTaskbarViewWindow", L"DynamicContent2" }) {
+            HWND feeds = FindWindowExW(m.bar, nullptr, cls, nullptr);
+            RECT fr{};
+            if (feeds && IsWindowVisible(feeds) && GetWindowRect(feeds, &fr) && fr.left < right && fr.right > fr.left)
+                right = fr.left;
+        }
         known = true;
     } else {
         AcquireSRWLockShared(&g_wbLock);
         for (const auto& s : g_spans)
             if (s.bar == m.bar && s.measured) {
                 right = s.hasClock ? s.clockLeft : bar.right - Px(8);
+                if (s.hasWidgets && s.widgets.left < right && s.widgets.right > right - m.size.cx - Px(2))
+                    right = s.widgets.left;
                 if (s.hasTasks) minLeft = s.tasksRight + Px(4);
                 known = true;
             }
@@ -611,6 +647,9 @@ void PositionMirror(Mirror& m) {
     }
     DWORD offset = 0, sz = sizeof(offset);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"TaskbarOffset", RRF_RT_REG_DWORD, nullptr, &offset, &sz) ==
+        ERROR_SUCCESS)
+        right -= Px((int)offset);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"SecondaryTaskbarOffset", RRF_RT_REG_DWORD, nullptr, &offset, &sz) ==
         ERROR_SUCCESS)
         right -= Px((int)offset);
     int left = right - m.size.cx - Px(2);
@@ -630,7 +669,7 @@ void AddTool(HWND w) {
     ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
     ti.hwnd = g_notify;
     ti.uId = (UINT_PTR)w;
-    ti.lpszText = const_cast<wchar_t*>(g_tipText.empty() ? L"Wireless Battery" : g_tipText.c_str());
+    ti.lpszText = const_cast<wchar_t*>(g_tipText.empty() ? L"BatteryHub" : g_tipText.c_str());
     SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
 }
 
@@ -835,7 +874,7 @@ bool Create(HINSTANCE inst, HWND notifyWnd, UINT clickMsg, bool lightTheme) {
         ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
         ti.hwnd = notifyWnd;
         ti.uId = (UINT_PTR)g_wnd;
-        ti.lpszText = const_cast<wchar_t*>(L"Wireless Battery");
+        ti.lpszText = const_cast<wchar_t*>(L"BatteryHub");
         SendMessageW(g_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
         SendMessageW(g_tip, TTM_SETMAXTIPWIDTH, 0, 600);
     }

@@ -130,6 +130,7 @@ bool ReadBattery20(Hidpp& h, BYTE idx, USHORT pid, DeviceStatus& s) {
                 s.levelText = (level & 8) ? L"Full" : (level & 4) ? L"Good" : (level & 2) ? L"Low" : L"Critical";
             }
             s.charging = st == 1 || st == 2 || st == 3;
+            s.full = st == 3;  // charging complete
             return true;
         }
     }
@@ -137,6 +138,7 @@ bool ReadBattery20(Hidpp& h, BYTE idx, USHORT pid, DeviceStatus& s) {
         if (h.Call(idx, f, 0, {}, p) && p.size() >= 3) {
             int st = p[2];
             s.charging = st >= 1 && st <= 4;
+            s.full = st == 3;  // charging complete
             s.percent = p[0] <= 100 ? p[0] : -1;
             if (s.percent == 0 && st == 3) s.percent = 100;
             return true;

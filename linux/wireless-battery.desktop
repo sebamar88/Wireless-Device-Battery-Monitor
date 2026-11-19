@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Wireless Battery
+Name=BatteryHub
 Comment=Show battery levels of wireless mice, keyboards and headsets in the system tray
 Exec=wireless-battery
 Icon=wireless-battery
